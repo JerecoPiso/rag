@@ -1,0 +1,170 @@
+import uuid
+from sqlalchemy.orm import Session
+from sqlalchemy import text as sa_text
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from fastapi import HTTPException
+from app.core.config import settings
+
+
+class VectorService:
+    def __init__(self, collection_name: str = "rag_documents"):
+        if not settings.QDRANT_URL:
+            raise HTTPException(status_code=500, detail="QDRANT_URL is not configured")
+        from ollama import Client as OllamaClient
+        self.embed_client = OllamaClient(host=settings.OLLAMA_URL)
+        self.collection_name = collection_name
+        try:
+            self.client = QdrantClient(url=settings.QDRANT_URL)
+            self.client.get_collections()  # verify Qdrant is reachable
+            print("connected")
+        except Exception as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Cannot connect to Qdrant at {settings.QDRANT_URL}. Make sure Qdrant is running. ({e})"
+            )
+        try:
+            self._ensure_collection()
+        except Exception as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Cannot connect to Ollama at {settings.OLLAMA_URL}. Make sure Ollama is running and '{settings.OLLAMA_EMBED_MODEL}' is pulled. ({e})"
+            )
+
+    def _embed(self, text: str) -> list[float]:
+        response = self.embed_client.embed(model=settings.OLLAMA_EMBED_MODEL, input=text)
+        print(response)
+        return response.embeddings[0]
+
+    def _ensure_collection(self):
+        existing = {c.name for c in self.client.get_collections().collections}
+        if self.collection_name not in existing:
+            dim = len(self._embed("test"))
+
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+            )
+
+    def _recreate_collection(self):
+        existing = {c.name for c in self.client.get_collections().collections}
+        if self.collection_name in existing:
+            self.client.delete_collection(self.collection_name)
+        self._ensure_collection()
+
+    def ingest(self, texts: list[str], metadatas: list[dict], batch_size: int = 50) -> int:
+        if not texts:
+            return 0
+        padded_meta = list(metadatas) + [{}] * (len(texts) - len(metadatas))
+        points = [
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector=self._embed(text),
+                payload={"text": text, **meta},
+            )
+            for text, meta in zip(texts, padded_meta)
+        ]
+        for i in range(0, len(points), batch_size):
+            self.client.upsert(collection_name=self.collection_name, points=points[i:i + batch_size])
+        return len(points)
+
+    def sync_from_db(self, db: Session, clear: bool = True) -> dict:
+        if clear:
+            self._recreate_collection()
+
+        sources = [
+            # "_patient_case_vital_vw",
+            # "_patient_case_nurses_note_vw",
+            "_patient_case_doctors_note_vw",
+            # "_patient_case_diet_vw",
+            # "_patient_animal_bite_vw",
+        ]
+
+        total  = 0
+        synced = []
+
+        for source in sources:
+            try:
+                result  = db.execute(sa_text(f"SELECT * FROM `{source}`"))
+                columns = list(result.keys())
+                rows    = result.fetchall()
+            except Exception:
+                continue
+
+            texts     = []
+            metadatas = []
+            for row in rows:
+                row_dict  = {col: val for col, val in zip(columns, row) if val is not None}
+                text_repr = f"[{source}] " + " | ".join(f"{k}: {v}" for k, v in row_dict.items())
+                texts.append(text_repr)
+                metadatas.append({"source": source, **{k: str(v) for k, v in row_dict.items()}})
+
+            if texts:
+                self.ingest(texts, metadatas)
+                total += len(texts)
+                synced.append({"source": source, "rows": len(texts)})
+
+        return {"total_ingested": total, "sources": synced}
+
+    def search(self, query: str, top_k: int = 5) -> list[dict]:
+        results = self.client.query_points(
+            collection_name=self.collection_name,
+            query=self._embed(query),
+            limit=top_k,
+        )
+        return [
+            {
+                "score": h.score,
+                "text": h.payload.get("text", ""),
+                "metadata": {k: v for k, v in h.payload.items() if k != "text"},
+            }
+            for h in results.points
+        ]
+
+    def ask(self, question: str, provider: str = "ollama") -> dict:
+        hits = self.search(question, top_k=5)
+        context = "\n\n".join(h["text"] for h in hits)
+        prompt = (
+            f"Use the following context to answer the question.\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question: {question}\n\n"
+            "Answer concisely based only on the provided context."
+        )
+        return {
+            "question": question,
+            "context": hits,
+            "answer": self._call_llm(provider, prompt),
+        }
+
+    def _call_llm(self, provider: str, prompt: str) -> str:
+        if provider == "openai":
+            from openai import OpenAI
+            r = OpenAI(api_key=settings.OPENAI_API_KEY).chat.completions.create(
+                model="gpt-4o", max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return r.choices[0].message.content.strip()
+
+        elif provider == "anthropic":
+            import anthropic
+            r = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY).messages.create(
+                model="claude-sonnet-4-6", max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return r.content[0].text.strip()
+
+        elif provider == "google":
+            from google import genai
+            r = genai.Client(api_key=settings.GOOGLE_API_KEY).models.generate_content(
+                model="gemini-2.0-flash", contents=prompt,
+            )
+            return r.text.strip()
+
+        elif provider == "ollama":
+            res = self.embed_client.chat(
+                model=settings.OLLAMA_LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return res.message.content.strip()
+
+        raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")

@@ -8,3 +8,7 @@ bcrypt==4.0.1
 python-jose[cryptography]
 alembic
 openai
+anthropic
+google-genai
+qdrant-client
+ollama
