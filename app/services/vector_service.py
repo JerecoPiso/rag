@@ -218,7 +218,7 @@ class VectorService:
             res = self.embed_client.chat(
                 model=settings.OLLAMA_LLM_MODEL,
                 messages=[{"role": "system", "content": system_prompt}] + messages,
-                options={"num_ctx": 8192}  # default is 2048, increase as needed
+                options={"num_ctx": 16384}  # default is 2048, increase as needed
             )
             return res.message.content.strip()
 
