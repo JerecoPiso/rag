@@ -22,6 +22,9 @@ class RAGService:
         elif self.provider == "google":
             from google import genai
             self.client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+        elif self.provider == "ollama":
+            from ollama import Client as OllamaClient
+            self.client = OllamaClient(host=settings.OLLAMA_URL)
         else:
             raise HTTPException(status_code=400, detail=f"Unknown provider: {self.provider}")
 
@@ -49,11 +52,18 @@ class RAGService:
             )
             return response.text.strip()
 
+        elif self.provider == "ollama":
+            response = self.client.chat(
+                model=settings.OLLAMA_LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.message.content.strip()
+
     def _get_schema(self) -> str:
         inspector = inspect(self.db.get_bind())
         parts     = []
         for view in inspector.get_view_names():
-            print(view)
+            # print(view)
             cols     = inspector.get_columns(view)
             col_defs = ", ".join(f"{c['name']} ({c['type']})" for c in cols)
             parts.append(f"View: {view}\n  Columns: {col_defs}")
@@ -62,8 +72,11 @@ class RAGService:
     def _generate_sql(self, question: str, schema: str) -> str:
         prompt = (
             f"Given this database schema:\n\n{schema}\n\n"
-            "Convert the following question to a valid SQL SELECT query. "
-            "Return ONLY the SQL query — no explanation, no markdown, no backticks.\n\n"
+            "Convert the following question to a valid SQL SELECT query.\n"
+            "STRICT RULES:\n"
+            "- Output ONLY a SELECT statement. No INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, or any other statement.\n"
+            "- Do NOT use markdown, backticks, or any explanation — raw SQL only.\n"
+            "- The query must begin with SELECT.\n\n"
             f"Question: {question}"
         )
         sql = self._call_llm(prompt)

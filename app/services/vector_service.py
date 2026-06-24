@@ -5,6 +5,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from fastapi import HTTPException
 from app.core.config import settings
+from app.utils.emr_formatter import format_record
 
 
 class VectorService:
@@ -17,7 +18,6 @@ class VectorService:
         try:
             self.client = QdrantClient(url=settings.QDRANT_URL)
             self.client.get_collections()  # verify Qdrant is reachable
-            print("connected")
         except Exception as e:
             raise HTTPException(
                 status_code=503,
@@ -33,14 +33,12 @@ class VectorService:
 
     def _embed(self, text: str) -> list[float]:
         response = self.embed_client.embed(model=settings.OLLAMA_EMBED_MODEL, input=text)
-        print(response)
         return response.embeddings[0]
 
     def _ensure_collection(self):
         existing = {c.name for c in self.client.get_collections().collections}
         if self.collection_name not in existing:
             dim = len(self._embed("test"))
-
             self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
@@ -68,16 +66,21 @@ class VectorService:
             self.client.upsert(collection_name=self.collection_name, points=points[i:i + batch_size])
         return len(points)
 
+    @staticmethod
+    def _is_id_column(col: str) -> bool:
+        lower = col.strip().lower()
+        return lower == "id" or lower.endswith("_id")
+
     def sync_from_db(self, db: Session, clear: bool = True) -> dict:
         if clear:
             self._recreate_collection()
 
         sources = [
-            # "_patient_case_vital_vw",
-            # "_patient_case_nurses_note_vw",
+            "_patient_case_vital_vw",
+            "_patient_case_nurses_note_vw",
             "_patient_case_doctors_note_vw",
-            # "_patient_case_diet_vw",
-            # "_patient_animal_bite_vw",
+            "_patient_case_diet_vw",
+            "_patient_animal_bite_vw",
         ]
 
         total  = 0
@@ -91,11 +94,12 @@ class VectorService:
             except Exception:
                 continue
 
-            texts     = []
-            metadatas = []
+            texts: list[str] = []
+            metadatas: list[dict] = []
             for row in rows:
-                row_dict  = {col: val for col, val in zip(columns, row) if val is not None}
-                text_repr = f"[{source}] " + " | ".join(f"{k}: {v}" for k, v in row_dict.items())
+                row_dict      = {col: val for col, val in zip(columns, row)}
+                row_dict_text = {col: val for col, val in row_dict.items() if not self._is_id_column(col)}
+                text_repr     = format_record(row_dict_text, source)
                 texts.append(text_repr)
                 metadatas.append({"source": source, **{k: str(v) for k, v in row_dict.items()}})
 
@@ -121,27 +125,65 @@ class VectorService:
             for h in results.points
         ]
 
-    def ask(self, question: str, provider: str = "ollama") -> dict:
-        hits = self.search(question, top_k=5)
+    _NO_ANSWER_PHRASES = (
+        "don't have enough information",
+        "do not have enough information",
+        "cannot find",
+        "not found in the context",
+        "no information",
+        "cannot be found",
+        "not available in the",
+        "not in the context",
+        "i'm unable to find",
+        "i am unable to find",
+        "not mentioned in",
+        "not provided in",
+        "there is no"
+    )
+
+    def _context_has_answer(self, answer: str) -> bool:
+        lower = answer.lower()
+        return not any(phrase in lower for phrase in self._NO_ANSWER_PHRASES)
+
+    def ask(self, question: str, provider: str = "ollama", history: list[dict] = []) -> dict:
+        if history:
+            recent_text  = " ".join(m["content"] for m in history[-4:])
+            search_query = f"{recent_text} {question}"
+        else:
+            search_query = question
+
+        hits    = self.search(search_query, top_k=5)
         context = "\n\n".join(h["text"] for h in hits)
-        prompt = (
-            f"Use the following context to answer the question.\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {question}\n\n"
-            "Answer concisely based only on the provided context."
+
+        history_note = (
+            "You may also use the conversation history to resolve follow-up references "
+            "(e.g. 'he', 'she', 'that patient', 'the same case') to subjects already established.\n"
+            if history else ""
         )
+        system_prompt = (
+            "You are a helpful medical assistant for a hospital system. "
+            "Do not answer questions or discuss topics outside this medical domain.\n\n"
+            "Use the following retrieved context as your primary source of facts to answer the user's question. "
+            f"{history_note}"
+            "If the answer cannot be found in the context or conversation history, say you don't have enough information — do not guess or fabricate.\n\n"
+            f"Retrieved Context:\n{context}"
+        )
+
+        messages = history + [{"role": "user", "content": question}]
+        answer   = self._call_llm(provider, system_prompt, messages)
         return {
             "question": question,
             "context": hits,
-            "answer": self._call_llm(provider, prompt),
+            "answer": answer,
+            "context_sufficient": self._context_has_answer(answer),
         }
 
-    def _call_llm(self, provider: str, prompt: str) -> str:
+    def _call_llm(self, provider: str, system_prompt: str, messages: list[dict]) -> str:
         if provider == "openai":
             from openai import OpenAI
             r = OpenAI(api_key=settings.OPENAI_API_KEY).chat.completions.create(
                 model="gpt-4o", max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "system", "content": system_prompt}] + messages,
             )
             return r.choices[0].message.content.strip()
 
@@ -149,21 +191,32 @@ class VectorService:
             import anthropic
             r = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY).messages.create(
                 model="claude-sonnet-4-6", max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
+                system=system_prompt,
+                messages=messages,
             )
             return r.content[0].text.strip()
 
         elif provider == "google":
             from google import genai
+            from google.genai import types
+            contents = [
+                types.Content(
+                    role="user" if m["role"] == "user" else "model",
+                    parts=[types.Part(text=m["content"])],
+                )
+                for m in messages
+            ]
             r = genai.Client(api_key=settings.GOOGLE_API_KEY).models.generate_content(
-                model="gemini-2.0-flash", contents=prompt,
+                model="gemini-2.0-flash",
+                config=types.GenerateContentConfig(system_instruction=system_prompt),
+                contents=contents,
             )
             return r.text.strip()
 
         elif provider == "ollama":
             res = self.embed_client.chat(
                 model=settings.OLLAMA_LLM_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "system", "content": system_prompt}] + messages,
             )
             return res.message.content.strip()
 

@@ -12,3 +12,5 @@ anthropic
 google-genai
 qdrant-client
 ollama
+faster-whisper
+python-multipart

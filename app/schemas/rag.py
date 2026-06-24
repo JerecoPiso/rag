@@ -1,9 +1,9 @@
 from pydantic import BaseModel
-from typing import Any, Literal
+from typing import Any, Literal, List
 
 class RAGRequest(BaseModel):
     question: str
-    provider: Literal["openai", "anthropic", "google"] = "google"
+    provider: Literal["openai", "anthropic", "google", "ollama"] = "google"
 
 class RAGResponse(BaseModel):
     question: str
@@ -36,10 +36,16 @@ class SearchResponse(BaseModel):
     query:   str
     results: list[SearchResult]
 
+class ChatMessage(BaseModel):
+    role:    Literal["user", "assistant"]
+    content: str
+
 class VectorRAGRequest(BaseModel):
-    question:   str
-    collection: str = "rag_documents"
-    provider:   Literal["openai", "anthropic", "google", "ollama"] = "ollama"
+    question:     str
+    collection:   str = "rag_documents"
+    provider:     Literal["openai", "anthropic", "google", "ollama"] = "ollama"
+    history:      List[ChatMessage] = []
+    sql_provider: Literal["openai", "anthropic", "google", "ollama"] | None = None
 
 class VectorRAGResponse(BaseModel):
     question: str

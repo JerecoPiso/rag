@@ -27,9 +27,23 @@ class RAGController:
         return {"query": data.query, "results": results}
 
     @staticmethod
-    def ask_vector(data: VectorRAGRequest):
+    def ask_vector(data: VectorRAGRequest, db: Session = Depends(get_db)):
         svc = VectorService(collection_name=data.collection)
-        return svc.ask(data.question, provider=data.provider)
+        history = [{"role": m.role, "content": m.content} for m in data.history]
+        result = svc.ask(data.question, provider=data.provider, history=history)
+
+        # if not result.get("context_sufficient", True):
+        #     sql_provider = data.sql_provider or data.provider
+        #     sql_result = RAGService(db, provider=sql_provider).ask(data.question)
+        #     return {
+        #         **result,
+        #         "answer": sql_result["answer"],
+        #         "sql": sql_result.get("sql"),
+        #         "sql_result": sql_result.get("result"),
+        #         "source": "sql",
+        #     }
+
+        return {**result, "source": "vector"}
 
     @staticmethod
     def sync(data: SyncRequest, db: Session = Depends(get_db)):
