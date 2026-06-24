@@ -2,7 +2,11 @@ import uuid
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sa_text
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct,
+    Filter, FieldCondition, MatchText,
+    TextIndexParams, TokenizerType,
+)
 from fastapi import HTTPException
 from app.core.config import settings
 from app.utils.emr_formatter import format_record
@@ -43,6 +47,20 @@ class VectorService:
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
             )
+        try:
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="text",
+                field_schema=TextIndexParams(
+                    type="text",
+                    tokenizer=TokenizerType.WORD,
+                    min_token_len=2,
+                    max_token_len=15,
+                    lowercase=True,
+                ),
+            )
+        except Exception:
+            pass
 
     def _recreate_collection(self):
         existing = {c.name for c in self.client.get_collections().collections}
@@ -110,20 +128,46 @@ class VectorService:
 
         return {"total_ingested": total, "sources": synced}
 
-    def search(self, query: str, top_k: int = 5) -> list[dict]:
-        results = self.client.query_points(
+    def search(self, query: str, top_k: int = 10) -> list[dict]:
+        # Semantic (vector) search
+        vector_hits = self.client.query_points(
             collection_name=self.collection_name,
             query=self._embed(query),
             limit=top_k,
         )
-        return [
-            {
+
+        # Keyword (full-text) search — catches exact names and terms the vector may miss
+        keyword_hits, _ = self.client.scroll(
+            collection_name=self.collection_name,
+            scroll_filter=Filter(
+                must=[FieldCondition(key="text", match=MatchText(text=query))]
+            ),
+            limit=top_k,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        seen = set()
+        results = []
+
+        for h in vector_hits.points:
+            seen.add(h.id)
+            results.append({
                 "score": h.score,
                 "text": h.payload.get("text", ""),
                 "metadata": {k: v for k, v in h.payload.items() if k != "text"},
-            }
-            for h in results.points
-        ]
+            })
+
+        for h in keyword_hits:
+            if h.id not in seen:
+                seen.add(h.id)
+                results.append({
+                    "score": 1.0,
+                    "text": h.payload.get("text", ""),
+                    "metadata": {k: v for k, v in h.payload.items() if k != "text"},
+                })
+
+        return results
 
     _NO_ANSWER_PHRASES = (
         "don't have enough information",
