@@ -137,7 +137,13 @@ class VectorService:
         )
 
         # Keyword (full-text) search — OR across individual tokens so partial queries still hit
-        tokens = [w for w in query.lower().split() if len(w) >= 3]
+        _STOPWORDS = {
+            "patient", "the", "and", "for", "tell", "about", "what", "who",
+            "give", "show", "find", "get", "his", "her", "this", "that",
+            "with", "from", "details", "info", "information", "records",
+            "case", "cases", "me", "all",
+        }
+        tokens = [w for w in query.lower().split() if len(w) >= 3 and w not in _STOPWORDS]
         keyword_hits = []
         if tokens:
             conditions = [FieldCondition(key="text", match=MatchText(text=t)) for t in tokens]
