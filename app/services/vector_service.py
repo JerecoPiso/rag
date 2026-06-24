@@ -76,11 +76,11 @@ class VectorService:
             self._recreate_collection()
 
         sources = [
-            "_patient_case_vital_vw",
-            "_patient_case_nurses_note_vw",
+            # "_patient_case_vital_vw",
+            # "_patient_case_nurses_note_vw",
             "_patient_case_doctors_note_vw",
-            "_patient_case_diet_vw",
-            "_patient_animal_bite_vw",
+            # "_patient_case_diet_vw",
+            # "_patient_animal_bite_vw",
         ]
 
         total  = 0
