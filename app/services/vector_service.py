@@ -136,16 +136,18 @@ class VectorService:
             limit=top_k,
         )
 
-        # Keyword (full-text) search — catches exact names and terms the vector may miss
-        keyword_hits, _ = self.client.scroll(
-            collection_name=self.collection_name,
-            scroll_filter=Filter(
-                must=[FieldCondition(key="text", match=MatchText(text=query))]
-            ),
-            limit=top_k,
-            with_payload=True,
-            with_vectors=False,
-        )
+        # Keyword (full-text) search — OR across individual tokens so partial queries still hit
+        tokens = [w for w in query.lower().split() if len(w) >= 3]
+        keyword_hits = []
+        if tokens:
+            conditions = [FieldCondition(key="text", match=MatchText(text=t)) for t in tokens]
+            keyword_hits, _ = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=Filter(should=conditions),
+                limit=top_k,
+                with_payload=True,
+                with_vectors=False,
+            )
 
         seen = set()
         results = []
@@ -262,7 +264,7 @@ class VectorService:
             res = self.embed_client.chat(
                 model=settings.OLLAMA_LLM_MODEL,
                 messages=[{"role": "system", "content": system_prompt}] + messages,
-                options={"num_ctx": 16384}  # default is 2048, increase as needed
+                options={"num_ctx": 25000}  # default is 2048, increase as needed
             )
             return res.message.content.strip()
 
