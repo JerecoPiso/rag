@@ -128,22 +128,25 @@ class VectorService:
 
         return {"total_ingested": total, "sources": synced}
 
-    def search(self, query: str, top_k: int = 10) -> list[dict]:
-        # Semantic (vector) search
+    _STOPWORDS = {
+        "patient", "the", "and", "for", "tell", "about", "what", "who",
+        "give", "show", "find", "get", "his", "her", "this", "that",
+        "with", "from", "details", "info", "information", "records",
+        "case", "cases", "me", "all", "how",
+    }
+
+    def search(self, query: str, top_k: int = 10, keyword_query: str = None) -> list[dict]:
+        # Semantic (vector) search — uses full history-aware query for context resolution
         vector_hits = self.client.query_points(
             collection_name=self.collection_name,
             query=self._embed(query),
             limit=top_k,
         )
 
-        # Keyword (full-text) search — OR across individual tokens so partial queries still hit
-        _STOPWORDS = {
-            "patient", "the", "and", "for", "tell", "about", "what", "who",
-            "give", "show", "find", "get", "his", "her", "this", "that",
-            "with", "from", "details", "info", "information", "records",
-            "case", "cases", "me", "all",
-        }
-        tokens = [w for w in query.lower().split() if len(w) >= 3 and w not in _STOPWORDS]
+        # Keyword (full-text) search — uses only the current question so history tokens
+        # don't flood the results and push out the actual target records
+        kw_source = keyword_query if keyword_query is not None else query
+        tokens = [w for w in kw_source.lower().split() if len(w) >= 3 and w not in self._STOPWORDS]
         keyword_hits = []
         if tokens:
             conditions = [FieldCondition(key="text", match=MatchText(text=t)) for t in tokens]
@@ -204,7 +207,7 @@ class VectorService:
         else:
             search_query = question
 
-        hits    = self.search(search_query, top_k=10)
+        hits    = self.search(search_query, top_k=10, keyword_query=question)
         
         context = "\n\n".join(h["text"] for h in hits)
 
