@@ -152,8 +152,10 @@ class VectorService:
         else:
             search_query = question
 
-        hits    = self.search(search_query, top_k=5)
-        context = "\n\n".join(h["text"] for h in hits)
+        hits  = self.search(search_query, top_k=10)
+        hits = [h for h in hits if h["score"] > 0.75]
+
+        context = "\n\n".join(h["text"][:500] for h in hits)
 
         history_note = (
             "You may also use the conversation history to resolve follow-up references "
@@ -217,6 +219,7 @@ class VectorService:
             res = self.embed_client.chat(
                 model=settings.OLLAMA_LLM_MODEL,
                 messages=[{"role": "system", "content": system_prompt}] + messages,
+                options={"num_ctx": 8192}  # default is 2048, increase as needed
             )
             return res.message.content.strip()
 
