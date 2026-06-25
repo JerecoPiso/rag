@@ -95,7 +95,7 @@ def format_vital_vw(row: dict, source: str) -> str:
         f"FORM_TYPE: {g('form_type')}",
         "",
         f"DOCTOR: {g('process_by')}",
-        f"CAPTURED: {g('vital_capture_timestamp')}",
+        f"CAPTURED: {g('vital_capture_timestamp')}",    
        "",
         "Chief Complaint:",
         g("complaint"),
@@ -229,12 +229,41 @@ def format_animal_bite_vw(row: dict, source: str) -> str:
     )
 
 
+def format_case_status_vw(row: dict, source: str) -> str:
+    g  = lambda key: _get(row, key)
+    gt = lambda key: _get(row, key, timedelta_as_time=True)
+    return _build(
+        "=== Patient Chart ===",
+        "TYPE: CASE_STATUS",
+        f"SOURCE_VIEW: {source}",
+        "",
+        f"Patient: {_patient_full_name(row)}",
+        f"Patient Type: {g('patient_type')}",
+        f"Case Classification: {g('case_classification')}",
+        f"Patient Status: {g('patient_status')}",
+        f"OPD/ER: {g('opd_er')}",
+        f"Station: {g('station')}",
+        "",
+        f"Chief Complaint: {g('complaint')}",
+        f"Initial Diagnosis: {g('initial_diagnosis')}",
+        f"Final Diagnosis: {g('final_diagnosis')}",
+        "",
+        "Discharge:",
+        f"  Type: {g('discharge_type')}",
+        f"  Date: {g('discharge_date')}",
+        f"  Time: {gt('discharge_time')}",
+        f"  Remarks: {g('discharge_remarks')}",
+        "",
+        "========================",
+    )
+
+
 def format_medical_consumption_vw(row: dict, source: str) -> str:
     g  = lambda key: _get(row, key)
     gt = lambda key: _get(row, key, timedelta_as_time=True)
     return _build(
         "=== Patient Chart ===",
-        "TYPE: MEDICAL_CONSUMPTION",
+        "TYPE: MEDICAL_CONSUMPTION (Ivf, Oxygen Consumption, CBG)",
         f"SOURCE_VIEW: {source}",
         "",
         f"Patient: {_patient_full_name(row)}",
@@ -311,6 +340,7 @@ _SOURCE_RECORD_TYPE = {
     "_patient_animal_bite_vw":       "ANIMAL_BITE",
     "_patient_case_medicine_vw":              "MEDICINE_ORDER",
     "_patient_case_medical_consumption_vw":   "MEDICAL_CONSUMPTION",
+    "_patient_case_status_vw":               "CASE_STATUS",
 }
 
 _SOURCE_DATE_FIELD = {
@@ -320,6 +350,7 @@ _SOURCE_DATE_FIELD = {
     "_patient_case_nurses_note_vw":  "nurses_note_date",
     "_patient_animal_bite_vw":                "vital_capture_timestamp",
     "_patient_case_medical_consumption_vw":   "medical_comsumption_date",
+    "_patient_case_status_vw":               "discharge_date",
 }
 
 
@@ -347,6 +378,7 @@ _FORMATTERS: dict[str, object] = {
     "_patient_animal_bite_vw":       format_animal_bite_vw,
     "_patient_case_medicine_vw":            format_medicine_vw,
     "_patient_case_medical_consumption_vw": format_medical_consumption_vw,
+    "_patient_case_status_vw":             format_case_status_vw,
 }
 
 

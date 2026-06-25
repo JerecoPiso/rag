@@ -110,7 +110,8 @@ class VectorService:
             "_patient_case_diet_vw",
             "_patient_animal_bite_vw",
             "_patient_case_medicine_vw",
-            "_patient_case_medical_consumption_vw"
+            "_patient_case_medical_consumption_vw",
+            "_patient_case_status_vw"
         ]
 
         total  = 0
