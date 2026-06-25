@@ -200,20 +200,11 @@ class VectorService:
         lower = answer.lower()
         return not any(phrase in lower for phrase in self._NO_ANSWER_PHRASES)
 
-    _MAX_HISTORY    = 10   # max messages sent to the LLM
-    _MAX_CTX_CHARS  = 8000 # max characters for retrieved context
-    _MAX_EMBED_CHARS = 1000 # max characters fed to the embedding model
+    _MAX_HISTORY   = 10   # max messages sent to the LLM
+    _MAX_CTX_CHARS = 8000 # max characters for retrieved context
 
     def ask(self, question: str, provider: str = "ollama", history: list[dict] = []) -> dict:
-        if history:
-            recent_text  = " ".join(m["content"] for m in history[-4:])
-            search_query = f"{recent_text} {question}"
-        else:
-            search_query = question
-
-        search_query = search_query[-self._MAX_EMBED_CHARS:]
-
-        hits    = self.search(search_query, top_k=10, keyword_query=question)
+        hits = self.search(question, top_k=10)
 
         raw_context = "\n\n".join(h["text"] for h in hits)
         context     = raw_context[:self._MAX_CTX_CHARS]
