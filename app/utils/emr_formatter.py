@@ -61,12 +61,12 @@ def format_doctors_note(row: dict, source: str) -> str:
         f"OPD/ER: {g('opd_er')}",
         f"Station: {g('station')}",
         f"Doctor: {g('process_by')}",
-        f"Date: {g('doctors_note_date')} {g('doctors_note_time')}",
+        f"Date / Seen By Doctor: {g('doctors_note_date')} {g('doctors_note_time')}",
         f"Chief Complaint: {g('complaint')}",
         f"Initial Diagnosis: {g('initial_diagnosis')}",
         f"Final Diagnosis: {g('final_diagnosis')}",
-        f"Doctors Orders / Doctors Notes: {g('grouped_doctors_notes')}",
-        # f"Progress Notes: {g('doctors_note_notes')}",
+        f"Doctors Orders / Doctors Notes: {g('doctors_note_order')}",
+        f"Progress Notes: {g('doctors_note_notes')}",
     )
 
 
