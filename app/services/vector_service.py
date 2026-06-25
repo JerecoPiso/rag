@@ -146,14 +146,21 @@ class VectorService:
         return {"total_ingested": total, "sources": synced}
 
     _STOPWORDS = {
+        # common English
         "patient", "the", "and", "for", "tell", "about", "what", "who",
         "give", "show", "find", "get", "his", "her", "this", "that",
         "with", "from", "details", "info", "information", "records",
-        "case", "cases", "me", "all", "how",
-        # instruction / action words that never appear in patient records
+        "case", "cases", "me", "all", "how", "its", "are", "was",
+        "were", "did", "does", "not", "don", "just", "also", "have",
+        "has", "had", "been", "will", "can", "could", "would", "may",
+        "might", "should", "please",
+        # instruction / action words
         "list", "down", "rephrase", "summarize", "describe", "explain",
-        "not", "don", "does", "did", "are", "was", "were", "just",
-        "please", "can", "could", "would", "should", "may", "might",
+        "latest", "recent", "last", "first", "new", "old", "full",
+        # medical domain words that appear in virtually every record
+        "medical", "record", "chart", "note", "notes", "order", "orders",
+        "doctor", "doctors", "nurse", "nurses", "history", "data",
+        "diagnosis", "complaint", "report", "result", "results",
     }
 
     def search(self, query: str, top_k: int = 10, keyword_query: str = None) -> list[dict]:
@@ -261,7 +268,7 @@ class VectorService:
 
     def ask(self, question: str, provider: str = "ollama", history: list[dict] = []) -> dict:
         search_query = self._resolve_query(question, history, provider)
-        hits = self.search(search_query, top_k=20, keyword_query=search_query)
+        hits = self.search(search_query, top_k=10, keyword_query=search_query)
 
         if not hits:
             return {
