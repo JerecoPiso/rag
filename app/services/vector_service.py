@@ -9,7 +9,7 @@ from qdrant_client.models import (
 )
 from fastapi import HTTPException
 from app.core.config import settings
-from app.utils.emr_formatter import format_record
+from app.utils.emr_formatter import format_record, build_metadata
 
 
 class VectorService:
@@ -30,10 +30,13 @@ class VectorService:
         try:
             self._ensure_collection()
         except Exception as e:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Cannot connect to Ollama at {settings.OLLAMA_URL}. Make sure Ollama is running and '{settings.OLLAMA_EMBED_MODEL}' is pulled. ({e})"
-            )
+            msg = str(e)
+            if "ollama" in msg.lower() or settings.OLLAMA_URL in msg:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Cannot connect to Ollama at {settings.OLLAMA_URL}. Make sure Ollama is running and '{settings.OLLAMA_EMBED_MODEL}' is pulled. ({e})"
+                )
+            raise HTTPException(status_code=503, detail=f"Failed to initialize collection: {e}")
 
     def _embed(self, text: str) -> list[float]:
         response = self.embed_client.embed(model=settings.OLLAMA_EMBED_MODEL, input=text)
@@ -43,10 +46,14 @@ class VectorService:
         existing = {c.name for c in self.client.get_collections().collections}
         if self.collection_name not in existing:
             dim = len(self._embed("test"))
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
-            )
+            try:
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+                )
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    raise
         try:
             self.client.create_payload_index(
                 collection_name=self.collection_name,
@@ -74,7 +81,10 @@ class VectorService:
         padded_meta = list(metadatas) + [{}] * (len(texts) - len(metadatas))
         points = [
             PointStruct(
-                id=str(uuid.uuid4()),
+                id=str(uuid.uuid5(
+                    uuid.NAMESPACE_DNS,
+                    f"{meta.get('source', '')}:{meta.get('case_id', '')}",
+                )),
                 vector=self._embed(text),
                 payload={"text": text, **meta},
             )
@@ -94,11 +104,13 @@ class VectorService:
             self._recreate_collection()
 
         sources = [
-            # "_patient_case_vital_vw",
-            # "_patient_case_nurses_note_vw",
+            "_patient_case_vital_vw",
+            "_patient_case_nurses_note_vw",
             "_patient_case_doctors_note_vw",
-            # "_patient_case_diet_vw",
-            # "_patient_animal_bite_vw",
+            "_patient_case_diet_vw",
+            "_patient_animal_bite_vw",
+            "_patient_case_medicine_vw",
+            "_patient_case_medical_consumption_vw"
         ]
 
         total  = 0
@@ -115,11 +127,15 @@ class VectorService:
             texts: list[str] = []
             metadatas: list[dict] = []
             for row in rows:
+               
                 row_dict      = {col: val for col, val in zip(columns, row)}
+                # print(row_dict)
                 row_dict_text = {col: val for col, val in row_dict.items() if not self._is_id_column(col)}
                 text_repr     = format_record(row_dict_text, source)
+                
                 texts.append(text_repr)
-                metadatas.append({"source": source, **{k: str(v) for k, v in row_dict.items()}})
+                
+                metadatas.append(build_metadata(row_dict, source))
 
             if texts:
                 self.ingest(texts, metadatas)
@@ -152,7 +168,7 @@ class VectorService:
             conditions = [FieldCondition(key="text", match=MatchText(text=t)) for t in tokens]
             keyword_hits, _ = self.client.scroll(
                 collection_name=self.collection_name,
-                scroll_filter=Filter(should=conditions),
+                scroll_filter=Filter(must=conditions),
                 limit=top_k,
                 with_payload=True,
                 with_vectors=False,
@@ -161,7 +177,11 @@ class VectorService:
         seen = set()
         results = []
 
+        MIN_VECTOR_SCORE = 0.75
+
         for h in vector_hits.points:
+            if h.score < MIN_VECTOR_SCORE:
+                continue
             seen.add(h.id)
             results.append({
                 "score": h.score,
@@ -203,8 +223,31 @@ class VectorService:
     _MAX_HISTORY   = 10   # max messages sent to the LLM
     _MAX_CTX_CHARS = 8000 # max characters for retrieved context
 
+    _FOLLOWUP_PRONOUNS = {"her", "his", "him", "she", "he", "they", "them", "their", "same", "that"}
+
+    def _resolve_query(self, question: str, history: list[dict], provider: str) -> str:
+        """Rewrite a follow-up question into a standalone query by resolving pronouns via history."""
+        if not history:
+            return question
+        words = set(question.lower().split())
+        if not (words & self._FOLLOWUP_PRONOUNS):
+            return question
+        system = (
+            "You are a query rewriter for a hospital search system. "
+            "Given the conversation history and a follow-up question, rewrite the follow-up question "
+            "as a fully standalone question by replacing all pronouns and references with the actual "
+            "patient name or specific subject from the history. "
+            "Return ONLY the rewritten question — no explanation, no punctuation changes beyond what is needed."
+        )
+        messages = history[-4:] + [{"role": "user", "content": f"Rewrite as standalone: {question}"}]
+        try:
+            return self._call_llm(provider, system, messages).strip()
+        except Exception:
+            return question
+
     def ask(self, question: str, provider: str = "ollama", history: list[dict] = []) -> dict:
-        hits = self.search(question, top_k=10)
+        search_query = self._resolve_query(question, history, provider)
+        hits = self.search(search_query, top_k=20, keyword_query=search_query)
 
         raw_context = "\n\n".join(h["text"] for h in hits)
         context     = raw_context[:self._MAX_CTX_CHARS]
@@ -216,10 +259,15 @@ class VectorService:
         )
         system_prompt = (
             "You are a helpful medical assistant for a hospital system. "
+            "Do not begin responses with phrases such as 'According to the context' or 'Based on the provided context.'"
             "Do not answer questions or discuss topics outside this medical domain.\n\n"
-            "Use the following retrieved context as your primary source of facts to answer the user's question. "
+            "To answer the user's question, combine information from BOTH the retrieved context and the conversation history. "
+            "Use the retrieved context for facts about patients, diagnoses, and records. "
+            "Use the conversation history to understand follow-up references and the flow of the conversation. "
+            "If the two sources conflict, prefer the retrieved context. "
             f"{history_note}"
-            "If the answer cannot be found in the context or conversation history, say you don't have enough information — do not guess or fabricate.\n\n"
+            "If the user provides only a patient name without a specific question, summarize all available medical information about that patient from the context (diagnosis, complaints, treatments, dates, etc.). "
+            "If the answer cannot be found in either the context or conversation history, say you don't have enough information — do not guess or fabricate.\n\n"
             f"Retrieved Context:\n{context}"
         )
 

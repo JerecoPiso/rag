@@ -51,6 +51,10 @@ def _build(*lines: str) -> str:
 def format_doctors_note(row: dict, source: str) -> str:
     g = lambda key: _get(row, key)
     return _build(
+        "=== Patient Chart ===",
+        "TYPE: Doctors Order / Doctors Notes",
+        f"SOURCE_VIEW: {source}",
+        "",
         f"Patient: {_patient_full_name(row)}",
         f"Patient Type: {g('patient_type')}",
         f"Case Classification: {g('case_classification')}",
@@ -61,8 +65,8 @@ def format_doctors_note(row: dict, source: str) -> str:
         f"Chief Complaint: {g('complaint')}",
         f"Initial Diagnosis: {g('initial_diagnosis')}",
         f"Final Diagnosis: {g('final_diagnosis')}",
-        f"Doctors Order: {g('doctors_note_order')}",
-        f"Progress Notes: {g('doctors_note_notes')}",
+        f"Doctors Orders / Doctors Notes: {g('grouped_doctors_notes')}",
+        # f"Progress Notes: {g('doctors_note_notes')}",
     )
 
 
@@ -79,7 +83,7 @@ def format_vital_vw(row: dict, source: str) -> str:
                 findings.append(f"- {tag}: {value}")
 
     return _build(
-        "=== EMR_RECORD ===",
+        "=== Patient Chart ===",
         "TYPE: CLINICAL_ASSESSMENT",
         f"SOURCE_VIEW: {source}",
         "",
@@ -112,7 +116,7 @@ def format_vital_vw(row: dict, source: str) -> str:
 def format_diet_vw(row: dict, source: str) -> str:
     g = lambda key: _get(row, key, timedelta_as_time=True)
     return _build(
-        "=== EMR_RECORD ===",
+        "=== Patient Chart ===",
         "TYPE: DIET_ORDER",
         f"SOURCE_VIEW: {source}",
         "",
@@ -142,7 +146,7 @@ def format_diet_vw(row: dict, source: str) -> str:
 def format_nurses_note_vw(row: dict, source: str) -> str:
     g = lambda key: _get(row, key)
     return _build(
-        "=== EMR_RECORD ===",
+        "=== Patient Chart ===",
         "TYPE: NURSE_NOTE",
         f"SOURCE_VIEW: {source}",
         "",
@@ -193,7 +197,7 @@ def format_animal_bite_vw(row: dict, source: str) -> str:
                 details.append(f"- {tag}: {value}")
 
     return _build(
-        "=== EMR_RECORD ===",
+        "=== format_doctors_note ===",
         "TYPE: ANIMAL_BITE",
         f"SOURCE_VIEW: {source}",
         "",
@@ -225,6 +229,112 @@ def format_animal_bite_vw(row: dict, source: str) -> str:
     )
 
 
+def format_medical_consumption_vw(row: dict, source: str) -> str:
+    g  = lambda key: _get(row, key)
+    gt = lambda key: _get(row, key, timedelta_as_time=True)
+    return _build(
+        "=== Patient Chart ===",
+        "TYPE: MEDICAL_CONSUMPTION",
+        f"SOURCE_VIEW: {source}",
+        "",
+        f"Patient: {_patient_full_name(row)}",
+        f"Patient Type: {g('patient_type')}",
+        f"Case Classification: {g('case_classification')}",
+        f"OPD/ER: {g('opd_er')}",
+        f"Station: {g('station')}",
+        f"Provider: {g('provider_name')}",
+        "",
+        f"Chief Complaint: {g('complaint')}",
+        f"Initial Diagnosis: {g('initial_diagnosis')}",
+        f"Final Diagnosis: {g('final_diagnosis')}",
+        "",
+        "Medicine:",
+        f"  Name: {g('medicine_name')}",
+        f"  Generic Name: {g('medicine_generic_name')}",
+        f"  Brand Name: {g('medicine_brand_name')}",
+        "",
+        "Consumption:",
+        f"  Type: {g('medical_comsumption_type')}",
+        f"  Date: {g('medical_comsumption_date')}",
+        f"  Start Time: {gt('medical_comsumption_start_time')}",
+        f"  End Time: {gt('medical_comsumption_end_time')}",
+        f"  Initial Reading: {g('medical_comsumption_initial_reading')}",
+        f"  Last Reading: {g('medical_comsumption_last_reading')}",
+        f"  Room: {g('medical_comsumption_room')}",
+        f"  Reference: {g('medical_comsumption_reference')}",
+        "",
+        "========================",
+    )
+
+
+def format_medicine_vw(row: dict, source: str) -> str:
+    g = lambda key: _get(row, key)
+    return _build(
+        "=== Patient Chart ===",
+        "TYPE: MEDICINE_ORDER",
+        f"SOURCE_VIEW: {source}",
+        "",
+        f"Patient: {_patient_full_name(row)}",
+        f"Patient Type: {g('patient_type')}",
+        f"Case Classification: {g('case_classification')}",
+        f"OPD/ER: {g('opd_er')}",
+        f"Station: {g('station')}",
+        f"Provider: {g('provider_name')}",
+        f"Form Type: {g('form_type')}",
+        "",
+        f"Chief Complaint: {g('complaint')}",
+        f"Initial Diagnosis: {g('initial_diagnosis')}",
+        f"Final Diagnosis: {g('final_diagnosis')}",
+        "",
+        "Medicine:",
+        f"  Name: {g('medicine_name')}",
+        f"  Generic Name: {g('medicine_generic_name')}",
+        f"  Brand Name: {g('medicine_brand_name')}",
+        f"  Schedule: {g('medicine_medication_schedule')}",
+        f"  Preparation: {g('medicine_preparation')}",
+        f"  Route: {g('medicine_route')}",
+        f"  Status: {g('type')}",
+        "",
+        "========================",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Metadata builder
+# ---------------------------------------------------------------------------
+
+_SOURCE_RECORD_TYPE = {
+    "_patient_case_doctors_note_vw": "DOCTOR_ORDER",
+    "_patient_case_vital_vw":        "CLINICAL_ASSESSMENT",
+    "_patient_case_diet_vw":         "DIET_ORDER",
+    "_patient_case_nurses_note_vw":  "NURSE_NOTE",
+    "_patient_animal_bite_vw":       "ANIMAL_BITE",
+    "_patient_case_medicine_vw":              "MEDICINE_ORDER",
+    "_patient_case_medical_consumption_vw":   "MEDICAL_CONSUMPTION",
+}
+
+_SOURCE_DATE_FIELD = {
+    "_patient_case_doctors_note_vw": "doctors_note_date",
+    "_patient_case_vital_vw":        "vital_capture_timestamp",
+    "_patient_case_diet_vw":         "diet_date",
+    "_patient_case_nurses_note_vw":  "nurses_note_date",
+    "_patient_animal_bite_vw":                "vital_capture_timestamp",
+    "_patient_case_medical_consumption_vw":   "medical_comsumption_date",
+}
+
+
+def build_metadata(row: dict, source: str) -> dict:
+    base = {
+        "source":       source,
+        "record_type":  _SOURCE_RECORD_TYPE.get(source, "UNKNOWN"),
+        "patient_name": _patient_full_name(row),
+        "doctor":       str(row.get("process_by") or ""),
+        # "date":         str(row.get(_SOURCE_DATE_FIELD.get(source, ""), "") or ""),
+    }
+    base.update({k: str(v) for k, v in row.items()})
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -235,6 +345,8 @@ _FORMATTERS: dict[str, object] = {
     "_patient_case_diet_vw":         format_diet_vw,
     "_patient_case_nurses_note_vw":  format_nurses_note_vw,
     "_patient_animal_bite_vw":       format_animal_bite_vw,
+    "_patient_case_medicine_vw":            format_medicine_vw,
+    "_patient_case_medical_consumption_vw": format_medical_consumption_vw,
 }
 
 
@@ -242,7 +354,7 @@ def format_record(row: dict, source: str) -> str:
     formatter = _FORMATTERS.get(source)
     if formatter:
         return formatter(row, source)
-    lines = ["=== EMR_RECORD ===", f"SOURCE_VIEW: {source}", ""]
+    lines = ["=== PATIENT CHART ===", f"SOURCE_VIEW: {source}", ""]
     for k, v in row.items():
         lines.append(f"{k.upper()}: {v}")
     lines += ["", "========================"]
