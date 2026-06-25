@@ -200,6 +200,10 @@ class VectorService:
         lower = answer.lower()
         return not any(phrase in lower for phrase in self._NO_ANSWER_PHRASES)
 
+    _MAX_HISTORY    = 10   # max messages sent to the LLM
+    _MAX_CTX_CHARS  = 8000 # max characters for retrieved context
+    _MAX_EMBED_CHARS = 1000 # max characters fed to the embedding model
+
     def ask(self, question: str, provider: str = "ollama", history: list[dict] = []) -> dict:
         if history:
             recent_text  = " ".join(m["content"] for m in history[-4:])
@@ -207,9 +211,12 @@ class VectorService:
         else:
             search_query = question
 
+        search_query = search_query[-self._MAX_EMBED_CHARS:]
+
         hits    = self.search(search_query, top_k=10, keyword_query=question)
-        
-        context = "\n\n".join(h["text"] for h in hits)
+
+        raw_context = "\n\n".join(h["text"] for h in hits)
+        context     = raw_context[:self._MAX_CTX_CHARS]
 
         history_note = (
             "You may also use the conversation history to resolve follow-up references "
@@ -225,7 +232,7 @@ class VectorService:
             f"Retrieved Context:\n{context}"
         )
 
-        messages = history + [{"role": "user", "content": question}]
+        messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
         answer   = self._call_llm(provider, system_prompt, messages)
         return {
             "question": question,
