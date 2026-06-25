@@ -250,6 +250,14 @@ class VectorService:
         search_query = self._resolve_query(question, history, provider)
         hits = self.search(search_query, top_k=20, keyword_query=search_query)
 
+        if not hits:
+            return {
+                "question": question,
+                "context": [],
+                "answer": "I don't have enough information to answer that. No matching patient records were found in the system.",
+                "context_sufficient": False,
+            }
+
         raw_context = "\n\n".join(h["text"] for h in hits)
         context     = raw_context[:self._MAX_CTX_CHARS]
 
