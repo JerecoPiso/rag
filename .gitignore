@@ -14,7 +14,8 @@ build/
 venv/
 env/
 ENV/
-
+app/__pycache__
+app/__pycache__/
 # Environment variables
 .env
 .env.*
