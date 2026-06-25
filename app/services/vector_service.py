@@ -150,6 +150,10 @@ class VectorService:
         "give", "show", "find", "get", "his", "her", "this", "that",
         "with", "from", "details", "info", "information", "records",
         "case", "cases", "me", "all", "how",
+        # instruction / action words that never appear in patient records
+        "list", "down", "rephrase", "summarize", "describe", "explain",
+        "not", "don", "does", "did", "are", "was", "were", "just",
+        "please", "can", "could", "would", "should", "may", "might",
     }
 
     def search(self, query: str, top_k: int = 10, keyword_query: str = None) -> list[dict]:
@@ -167,6 +171,7 @@ class VectorService:
         keyword_hits = []
         if tokens:
             conditions = [FieldCondition(key="text", match=MatchText(text=t)) for t in tokens]
+            # Try strict AND first; fall back to OR if nothing matches
             keyword_hits, _ = self.client.scroll(
                 collection_name=self.collection_name,
                 scroll_filter=Filter(must=conditions),
@@ -174,6 +179,14 @@ class VectorService:
                 with_payload=True,
                 with_vectors=False,
             )
+            if not keyword_hits:
+                keyword_hits, _ = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=Filter(should=conditions),
+                    limit=top_k,
+                    with_payload=True,
+                    with_vectors=False,
+                )
 
         seen = set()
         results = []
