@@ -533,7 +533,7 @@ class VectorService:
 
     # ── LLM Dispatch ─────────────────────────────────────────────────────────
 
-    def _call_llm(self, provider: str, system_prompt: str, messages: list[dict], temperature: float = 0.7) -> str:
+    def _call_llm(self, provider: str, system_prompt: str, messages: list[dict], temperature: float = 0.1) -> str:
         if provider == "openai":
             from openai import OpenAI
             r = OpenAI(api_key=settings.OPENAI_API_KEY).chat.completions.create(
@@ -573,7 +573,25 @@ class VectorService:
             res = self.embed_client.chat(
                 model=settings.OLLAMA_LLM_MODEL,
                 messages=[{"role": "system", "content": system_prompt}] + messages,
-                options={"num_ctx": 25000, "temperature": temperature},
+                options={"num_ctx": 25000, "temperature": temperature,  
+                    "top_k": 40,
+                    "top_p": 0.9,
+                    "min_p": 0.05,
+                    "num_ctx": 8192,
+                    "num_predict": 512,
+                    "repeat_penalty": 1.1,
+                    "repeat_last_n": 64,
+                    "seed": 42,
+                    "stop": ["</s>"],
+                    "num_thread": 8,
+                    "num_gpu": 1,
+                    "mirostat": 0,
+                    "mirostat_tau": 5.0,
+                    "mirostat_eta": 0.1,
+                    "tfs_z": 1.0,
+                    "typical_p": 1.0,
+                    "presence_penalty": 0.0,
+                    "frequency_penalty": 0.0,},
             )
             return res.message.content.strip()
 

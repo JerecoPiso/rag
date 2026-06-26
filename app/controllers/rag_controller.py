@@ -6,6 +6,7 @@ from app.core.security import get_current_user
 from app.models.user import User
 from app.services.rag_service import RAGService
 from app.services.vector_service import VectorService
+from app.services.vector_service_v2 import VectorServiceV2
 from app.schemas.rag import RAGRequest, IngestRequest, SearchRequest, VectorRAGRequest, SyncRequest
 
 # In-memory session store: conversation_id → {"active_patient": "..."}
@@ -36,7 +37,7 @@ class RAGController:
             _sessions[conv_id] = {}
         session = _sessions[conv_id]
 
-        svc     = VectorService(collection_name=data.collection)
+        svc     = VectorServiceV2(collection_name=data.collection)
         history = [{"role": m.role, "content": m.content} for m in data.history]
         result  = svc.ask(data.question, provider=data.provider, history=history, session=session)
 
