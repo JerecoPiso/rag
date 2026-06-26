@@ -1,10 +1,12 @@
+import re
+import json
 import uuid
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sa_text
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
-    Filter, FieldCondition, MatchText,
+    Filter, FieldCondition, MatchText, MatchValue,
     TextIndexParams, TokenizerType,
 )
 from fastapi import HTTPException
@@ -54,6 +56,7 @@ class VectorService:
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
+        # Full-text index on the formatted record text
         try:
             self.client.create_payload_index(
                 collection_name=self.collection_name,
@@ -65,6 +68,30 @@ class VectorService:
                     max_token_len=15,
                     lowercase=True,
                 ),
+            )
+        except Exception:
+            pass
+        # Text index on patient_name for precise name filtering
+        try:
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="patient_name",
+                field_schema=TextIndexParams(
+                    type="text",
+                    tokenizer=TokenizerType.WORD,
+                    min_token_len=2,
+                    max_token_len=15,
+                    lowercase=True,
+                ),
+            )
+        except Exception:
+            pass
+        # Keyword index on record_type for exact filtering
+        try:
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="record_type",
+                field_schema="keyword",
             )
         except Exception:
             pass
@@ -111,7 +138,12 @@ class VectorService:
             "_patient_animal_bite_vw",
             "_patient_case_medicine_vw",
             "_patient_case_medical_consumption_vw",
-            "_patient_case_status_vw"
+            "_patient_case_status_vw",
+            "_patient_tpr_vw",
+            "_patient_opr_vw",
+            "_patient_monitor_vw",
+            "_patient_fluid_intake_and_output_vw",
+            "_patient_diagnostics_vw"
         ]
 
         total  = 0
@@ -128,14 +160,10 @@ class VectorService:
             texts: list[str] = []
             metadatas: list[dict] = []
             for row in rows:
-               
                 row_dict      = {col: val for col, val in zip(columns, row)}
-                # print(row_dict)
                 row_dict_text = {col: val for col, val in row_dict.items() if not self._is_id_column(col)}
                 text_repr     = format_record(row_dict_text, source)
-                
                 texts.append(text_repr)
-                
                 metadatas.append(build_metadata(row_dict, source))
 
             if texts:
@@ -145,57 +173,134 @@ class VectorService:
 
         return {"total_ingested": total, "sources": synced}
 
-    _STOPWORDS = {
-        # common English
-        "patient", "the", "and", "for", "tell", "about", "what", "who",
-        "give", "show", "find", "get", "his", "her", "this", "that",
-        "with", "from", "details", "info", "information", "records",
-        "case", "cases", "me", "all", "how", "its", "are", "was",
-        "were", "did", "does", "not", "don", "just", "also", "have",
-        "has", "had", "been", "will", "can", "could", "would", "may",
-        "might", "should", "please",
-        # instruction / action words
-        "list", "down", "rephrase", "summarize", "describe", "explain",
-        "latest", "recent", "last", "first", "new", "old", "full",
-        # medical domain words that appear in virtually every record
-        "medical", "record", "chart", "note", "notes", "order", "orders",
-        "doctor", "doctors", "nurse", "nurses", "history", "data",
-        "diagnosis", "complaint", "report", "result", "results",
+    # ── Query Decomposition ───────────────────────────────────────────────────
+
+    _VALID_RECORD_TYPES = {
+        "DOCTOR_ORDER", "NURSE_NOTE", "DIET_ORDER",
+        "VITAL_SIGNS", "ANIMAL_BITE", "MEDICINE",
+        "MEDICAL_CONSUMPTION", "CASE_STATUS",
     }
 
-    def search(self, query: str, top_k: int = 10, keyword_query: str = None) -> list[dict]:
-        # Semantic (vector) search — uses full history-aware query for context resolution
+    def _decompose_query(self, question: str, provider: str) -> dict:
+        """
+        LLM responsibility: extract search_intent and record_type from the current question only.
+        Patient name resolution is handled entirely by code — not the LLM.
+        """
+        system = (
+            "You are a query analyzer for a hospital EMR system.\n"
+            "Given a question, extract:\n"
+            "- search_intent: the core medical information being requested as a clean phrase "
+            "(remove filler like 'show me', 'can you tell me', 'what is'; keep all medical terms and any names)\n"
+            "- record_type: one of the values below, or null if general:\n"
+            "  DOCTOR_ORDER  → doctors orders, doctors notes\n"
+            "  NURSE_NOTE    → nurses notes\n"
+            "  DIET_ORDER    → diet orders\n"
+            "  VITAL_SIGNS   → vitals, blood pressure, temperature, weight\n"
+            "  ANIMAL_BITE   → animal bite records\n"
+            "  MEDICINE      → medicines, prescriptions, medications\n"
+            "  MEDICAL_CONSUMPTION → consumed / given medicines\n"
+            "  CASE_STATUS   → case status, admission, discharge\n\n"
+            "Respond in JSON only — no explanation:\n"
+            '{"search_intent": "...", "record_type": "..."}\n'
+            "Use null (not empty string) when a field is not applicable."
+        )
+        try:
+            raw = self._call_llm(provider, system, [{"role": "user", "content": question}], temperature=0).strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw)
+            data = json.loads(raw)
+            search_intent = (data.get("search_intent") or question).strip()
+            record_type   = (data.get("record_type")   or "").strip().upper()
+            if record_type not in self._VALID_RECORD_TYPES:
+                record_type = ""
+            return {"search_intent": search_intent, "record_type": record_type}
+        except Exception:
+            return {"search_intent": question, "record_type": ""}
+
+    # ── Search ────────────────────────────────────────────────────────────────
+
+    _STOPWORDS = {
+        # "patient", "the", "and", "for", "tell", "about", "what", "who",
+        # "give", "show", "find", "get", "his", "her", "this", "that",
+        # "with", "from", "details", "info", "information", "records",
+        # "case", "cases", "me", "all", "how", "its", "are", "was",
+        # "were", "did", "does", "not", "don", "just", "also", "have",
+        # "has", "had", "been", "will", "can", "could", "would", "may",
+        # "might", "should", "please",
+        # "when", "where", "why", "time", "date", "seen", "visit",
+        # "last", "ago", "since", "ever", "year", "month", "week", "day",
+        # "list", "down", "rephrase", "summarize", "describe", "explain",
+        # "latest", "recent", "first", "new", "old", "full",
+        # "medical", "record", "chart", "note", "notes", "order", "orders",
+        # "doctor", "doctors", "nurse", "nurses", "history", "data",
+        # "diagnosis", "complaint", "report", "result", "results",
+        "can", "you", "show", "me"
+    }
+
+    def _build_filter(self, patient_name: str, record_type: str) -> Filter | None:
+        """Build a Qdrant hard filter from patient name and/or record type.
+
+        Uses only the first and last word of the name to avoid over-constraining —
+        full names extracted from history (e.g. 'Mark Jhapat Recto Lomeda') would
+        require all 4 tokens to match, which fails if any middle/suffix word differs.
+        """
+        must = []
+        if patient_name:
+            parts = [p for p in patient_name.lower().split() if len(p) >= 2]
+            # first name + last name only; middle names add risk without benefit
+            key_parts = [parts[0]] if len(parts) == 1 else [parts[0], parts[-1]]
+            for part in key_parts:
+                must.append(FieldCondition(key="patient_name", match=MatchText(text=part)))
+        if record_type:
+            must.append(FieldCondition(key="record_type", match=MatchValue(value=record_type)))
+        return Filter(must=must) if must else None
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        keyword_query: str = None,
+        patient_name: str = "",
+        record_type: str = "",
+    ) -> list[dict]:
+        hard_filter = self._build_filter(patient_name, record_type) if patient_name else None
+
+        # Semantic search — embed only the clean search intent; hard filter narrows scope
         vector_hits = self.client.query_points(
             collection_name=self.collection_name,
             query=self._embed(query),
+            query_filter=hard_filter,
             limit=top_k,
         )
 
-        # Keyword (full-text) search — uses only the current question so history tokens
-        # don't flood the results and push out the actual target records
-        kw_source = keyword_query if keyword_query is not None else query
-        tokens = [w for w in kw_source.lower().split() if len(w) >= 3 and w not in self._STOPWORDS]
+        # Keyword search — combine hard filter with stopword-filtered text tokens
+        kw_source  = keyword_query if keyword_query is not None else query
+        # and w not in self._STOPWORDS
+        kw_tokens  = [w for w in kw_source.lower().split() if len(w) >= 3 ]
+        hard_conds = list(hard_filter.must) if hard_filter else []
+
         keyword_hits = []
-        if tokens:
-            conditions = [FieldCondition(key="text", match=MatchText(text=t)) for t in tokens]
-            # Try strict AND first; fall back to OR if nothing matches
+        if hard_conds or kw_tokens:
+            # Start strict: hard filter + all keyword tokens AND'd
+            all_conds = hard_conds + [FieldCondition(key="text", match=MatchText(text=t)) for t in kw_tokens]
             keyword_hits, _ = self.client.scroll(
                 collection_name=self.collection_name,
-                scroll_filter=Filter(must=conditions),
+                scroll_filter=Filter(must=all_conds),
                 limit=top_k,
                 with_payload=True,
                 with_vectors=False,
             )
-            if not keyword_hits:
+            # Fall back to just the hard filter (patient + record type) if no text-token matches
+            if not keyword_hits and hard_conds:
                 keyword_hits, _ = self.client.scroll(
                     collection_name=self.collection_name,
-                    scroll_filter=Filter(should=conditions),
+                    scroll_filter=Filter(must=hard_conds),
                     limit=top_k,
                     with_payload=True,
                     with_vectors=False,
                 )
 
-        seen = set()
+        seen    = set()
         results = []
 
         MIN_VECTOR_SCORE = 0.75
@@ -206,7 +311,7 @@ class VectorService:
             seen.add(h.id)
             results.append({
                 "score": h.score,
-                "text": h.payload.get("text", ""),
+                "text":  h.payload.get("text", ""),
                 "metadata": {k: v for k, v in h.payload.items() if k != "text"},
             })
 
@@ -215,11 +320,13 @@ class VectorService:
                 seen.add(h.id)
                 results.append({
                     "score": 1.0,
-                    "text": h.payload.get("text", ""),
+                    "text":  h.payload.get("text", ""),
                     "metadata": {k: v for k, v in h.payload.items() if k != "text"},
                 })
 
         return results
+
+    # ── Answer Generation ─────────────────────────────────────────────────────
 
     _NO_ANSWER_PHRASES = (
         "don't have enough information",
@@ -241,41 +348,147 @@ class VectorService:
         lower = answer.lower()
         return not any(phrase in lower for phrase in self._NO_ANSWER_PHRASES)
 
-    _MAX_HISTORY   = 10   # max messages sent to the LLM
-    _MAX_CTX_CHARS = 8000 # max characters for retrieved context
+    _MAX_HISTORY   = 100
+    _MAX_CTX_CHARS = 800000
 
-    _FOLLOWUP_PRONOUNS = {"her", "his", "him", "she", "he", "they", "them", "their", "same", "that"}
+    # Words that implicitly reference a previously mentioned patient
+    _IMPLICIT_REFS = frozenset({
+        "he", "she", "they", "his", "her", "him", "their", "them",
+        "it", "this", "that", "these", "those",
+    })
+    _PATIENT_PHRASES = re.compile(
+        r'\b(the patient|that patient|same patient|this patient|the same patient)\b',
+        re.IGNORECASE,
+    )
 
-    def _resolve_query(self, question: str, history: list[dict], provider: str) -> str:
-        """Rewrite a follow-up question into a standalone query by resolving pronouns via history."""
-        if not history:
-            return question
+    # Words that cannot start a valid patient name
+    _NON_NAME_STARTS = frozenset({
+        "the", "a", "an", "this", "that", "these", "those",
+        "our", "their", "your", "my", "its",
+    })
+
+    # Ordered extraction patterns — tried in sequence on any text
+    _NAME_PATTERNS = [
+        # Structured output: "Patient Name: Mark Jhapet Recto Lomeda"
+        re.compile(r'Patient\s+Name\s*[:\-]\s*([A-Za-z][A-Za-z\s]{3,50}?)(?:\n|\*|$)', re.IGNORECASE),
+
+        # Any possessive: "Mark Jhapet's ..."
+        re.compile(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})'s\b", re.IGNORECASE),
+
+        # Explicit keyword triggers before the name
+        re.compile(
+            r'(?:records?\s+of|record\s+of|chart\s+of|file\s+of|history\s+of|'
+            r'info(?:rmation)?\s+of|details?\s+of|case\s+of|data\s+of|'
+            r'patient\s+(?:chart|record|file|history|info(?:rmation)?)\s+of|'
+            r'about|show(?:\s+me)?|find|for|get)\s+'
+            r'([A-Za-z]{2,}(?:\s+[A-Za-z]{2,}){1,4})',
+            re.IGNORECASE,
+        ),
+
+        # "of <name>" at the very end of the question (name must be 2+ words)
+        re.compile(
+            r'\bof\s+([A-Za-z]{3,}(?:\s+[A-Za-z]{2,}){1,4})\s*[?.!]?\s*$',
+            re.IGNORECASE,
+        ),
+    ]
+
+    def _extract_name(self, text: str) -> str:
+        """Extract a patient name from any text using the ordered pattern list."""
+        for pattern in self._NAME_PATTERNS:
+            m = pattern.search(text)
+            if not m:
+                continue
+            name = m.group(1).strip().rstrip("'s").strip()
+            parts = name.split()
+            # Reject if it starts with an article/determiner or is too short
+            if not parts or parts[0].lower() in self._NON_NAME_STARTS:
+                continue
+            if len(parts) >= 2 or (len(parts) == 1 and len(parts[0]) >= 4):
+                return name
+        return ""
+
+    def _resolve_active_patient(self, history: list[dict]) -> str:
+        """Scan history (most recent first, both roles) for the last active patient name."""
+        for msg in reversed(history):
+            name = self._extract_name(msg.get("content", ""))
+            if name:
+                return name
+        return ""
+
+    def _references_active_patient(self, question: str) -> bool:
+        """Return True if the question uses pronouns or patient-reference phrases."""
         words = set(question.lower().split())
-        if not (words & self._FOLLOWUP_PRONOUNS):
-            return question
-        system = (
-            "You are a query rewriter for a hospital search system. "
-            "Given the conversation history and a follow-up question, rewrite the follow-up question "
-            "as a fully standalone question by replacing all pronouns and references with the actual "
-            "patient name or specific subject from the history. "
-            "Return ONLY the rewritten question — no explanation, no punctuation changes beyond what is needed."
-        )
-        messages = history[-4:] + [{"role": "user", "content": f"Rewrite as standalone: {question}"}]
-        try:
-            return self._call_llm(provider, system, messages).strip()
-        except Exception:
-            return question
+        return bool(words & self._IMPLICIT_REFS) or bool(self._PATIENT_PHRASES.search(question))
 
-    def ask(self, question: str, provider: str = "ollama", history: list[dict] = []) -> dict:
-        search_query = self._resolve_query(question, history, provider)
-        hits = self.search(search_query, top_k=10, keyword_query=search_query)
+    def _substitute_patient(self, text: str, name: str) -> str:
+        """Replace implicit references in text with the resolved patient name."""
+        result = self._PATIENT_PHRASES.sub(name, text)
+        return " ".join(name if w.lower() in self._IMPLICIT_REFS else w for w in result.split())
+
+    def ask(self, question: str, provider: str = "ollama", history: list[dict] = [], session: dict = None) -> dict:
+        if session is None:
+            session = {}
+
+        # LLM: extract search_intent and record_type only (no patient name — unreliable with local models)
+        decomposed    = self._decompose_query(question, provider)
+        search_intent = decomposed["search_intent"]
+        record_type   = decomposed["record_type"]
+
+        # Layer 1: extract patient name directly from the current question via regex
+        patient_name = self._extract_name(question)
+
+        if patient_name:
+            # New patient mentioned — update sessionuui
+            session["active_patient"] = patient_name
+        else:
+            # Layer 2: reuse the patient stored in session from a prior turn
+            if session.get("active_patient"):
+                patient_name = session["active_patient"]
+                if self._references_active_patient(question):
+                    search_intent = self._substitute_patient(question, patient_name)
+            # Layer 3: session is empty — scan history as a last resort
+            elif self._references_active_patient(question):
+                patient_name = self._resolve_active_patient(history)
+                if patient_name:
+                    session["active_patient"] = patient_name
+                    search_intent = self._substitute_patient(question, patient_name)
+        if patient_name and patient_name.strip():
+            hits = self.search(
+                search_intent,
+                top_k=25,
+                keyword_query=search_intent,
+                patient_name=patient_name,
+                record_type=record_type,
+            )
+        else:
+            print("no patient")
+            hits = self.search(
+                question,
+                top_k=25,
+                keyword_query=question,
+            )
 
         if not hits:
+            if patient_name:
+                return {
+                    "question": question,
+                    "context":  [],
+                    "answer":   "I don't have enough information to answer that. No matching patient records were found in the system.",
+                    "context_sufficient": False,
+                }
+            # No patient context — respond conversationally (greetings, small talk, etc.)
+            system_prompt = (
+                "You are a helpful medical assistant for a hospital system. "
+                "Respond naturally to the user's message. For greetings or small talk, reply politely. "
+                "Do not discuss topics outside the medical domain."
+            )
+            messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
+            answer = self._call_llm(provider, system_prompt, messages)
             return {
                 "question": question,
-                "context": [],
-                "answer": "I don't have enough information to answer that. No matching patient records were found in the system.",
-                "context_sufficient": False,
+                "context":  [],
+                "answer":   answer,
+                "context_sufficient": True,
             }
 
         raw_context = "\n\n".join(h["text"] for h in hits)
@@ -288,7 +501,7 @@ class VectorService:
         )
         system_prompt = (
             "You are a helpful medical assistant for a hospital system. "
-            "Do not begin responses with phrases such as 'According to the context' or 'Based on the provided context.'"
+            "Do not begin responses with phrases such as 'According to the context' or 'Based on the provided context.' "
             "Do not answer questions or discuss topics outside this medical domain.\n\n"
             "To answer the user's question, combine information from BOTH the retrieved context and the conversation history. "
             "Use the retrieved context for facts about patients, diagnoses, and records. "
@@ -303,17 +516,20 @@ class VectorService:
         messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
         answer   = self._call_llm(provider, system_prompt, messages)
         return {
+            
             "question": question,
-            "context": hits,
-            "answer": answer,
+            "context":  hits,
+            "answer":   answer,
             "context_sufficient": self._context_has_answer(answer),
         }
 
-    def _call_llm(self, provider: str, system_prompt: str, messages: list[dict]) -> str:
+    # ── LLM Dispatch ─────────────────────────────────────────────────────────
+
+    def _call_llm(self, provider: str, system_prompt: str, messages: list[dict], temperature: float = 0.7) -> str:
         if provider == "openai":
             from openai import OpenAI
             r = OpenAI(api_key=settings.OPENAI_API_KEY).chat.completions.create(
-                model="gpt-4o", max_tokens=1024,
+                model="gpt-4o", max_tokens=1024, temperature=temperature,
                 messages=[{"role": "system", "content": system_prompt}] + messages,
             )
             return r.choices[0].message.content.strip()
@@ -322,6 +538,7 @@ class VectorService:
             import anthropic
             r = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY).messages.create(
                 model="claude-sonnet-4-6", max_tokens=1024,
+                temperature=temperature,
                 system=system_prompt,
                 messages=messages,
             )
@@ -339,7 +556,7 @@ class VectorService:
             ]
             r = genai.Client(api_key=settings.GOOGLE_API_KEY).models.generate_content(
                 model="gemini-2.0-flash",
-                config=types.GenerateContentConfig(system_instruction=system_prompt),
+                config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=temperature),
                 contents=contents,
             )
             return r.text.strip()
@@ -348,7 +565,7 @@ class VectorService:
             res = self.embed_client.chat(
                 model=settings.OLLAMA_LLM_MODEL,
                 messages=[{"role": "system", "content": system_prompt}] + messages,
-                options={"num_ctx": 25000}  # default is 2048, increase as needed
+                options={"num_ctx": 25000, "temperature": temperature},
             )
             return res.message.content.strip()
 

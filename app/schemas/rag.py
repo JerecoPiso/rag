@@ -41,16 +41,19 @@ class ChatMessage(BaseModel):
     content: str
 
 class VectorRAGRequest(BaseModel):
-    question:     str
-    collection:   str = "rag_documents"
-    provider:     Literal["openai", "anthropic", "google", "ollama"] = "ollama"
-    history:      List[ChatMessage] = []
-    sql_provider: Literal["openai", "anthropic", "google", "ollama"] | None = None
+    question:        str
+    collection:      str = "rag_documents"
+    provider:        Literal["openai", "anthropic", "google", "ollama"] = "ollama"
+    history:         List[ChatMessage] = []
+    sql_provider:    Literal["openai", "anthropic", "google", "ollama"] | None = None
+    conversation_id: str | None = None
 
 class VectorRAGResponse(BaseModel):
-    question: str
-    context:  list[SearchResult]
-    answer:   str
+    question:        str
+    context:         list[SearchResult]
+    answer:          str
+    conversation_id: str
+    source:          str = "vector"
 
 class SyncRequest(BaseModel):
     collection: str = "rag_documents"

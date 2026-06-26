@@ -70,7 +70,7 @@ def format_doctors_note(row: dict, source: str) -> str:
     )
 
 
-def format_vital_vw(row: dict, source: str) -> str:
+def format_clinical_assessements_vw(row: dict, source: str) -> str:
     g = lambda key: _get(row, key)
 
     findings: list[str] = []
@@ -84,7 +84,178 @@ def format_vital_vw(row: dict, source: str) -> str:
 
     return _build(
         "=== Patient Chart ===",
-        "TYPE: Clinical Assessment / Medical History",
+        "TYPE: Clinical Assessment / Physical Examinations",
+        f"SOURCE_VIEW: {source}",
+        "",
+        f"Patient: {_patient_full_name(row)}",
+        f"Patient Type: {g('patient_type')}",
+        f"Case Classification: {g('case_classification')}",
+        f"OPD/ER: {g('opd_er')}",
+        f"Station: {g('station')}",
+        f"FORM_TYPE: {g('form_type')}",
+        "",
+        f"DOCTOR: {g('process_by')}",
+        f"CAPTURED: {g('vital_capture_timestamp')}",    
+       "",
+        "Chief Complaint:",
+        g("complaint"),
+        "",
+        "Initial Diagnosis:",
+        g("initial_diagnosis"),
+        "",
+        "Final Diagnosis:",
+        g("final_diagnosis"),
+        "",
+        "CLINICAL_FINDINGS:",
+        *findings,
+        "",
+        "========================",
+    )
+
+
+def format_tpr_vital_vw(row: dict, source: str) -> str:
+    g = lambda key: _get(row, key)
+
+    findings: list[str] = []
+    raw = row.get("vital") or ""
+    if raw:
+        for entry in parse_tag_value_string(str(raw), value_key="measure"):
+            tag   = entry.get("tag", "").strip()
+            value = entry.get("measure", "").strip()
+            if tag:
+                findings.append(f"- {tag}: {value}")
+
+    return _build(
+        "=== Patient Chart ===",
+        "TYPE: TPR (Temperature, Pulse, Rate) Ward Vital Signs",
+        f"SOURCE_VIEW: {source}",
+        "",
+        f"Patient: {_patient_full_name(row)}",
+        f"Patient Type: {g('patient_type')}",
+        f"Case Classification: {g('case_classification')}",
+        f"OPD/ER: {g('opd_er')}",
+        f"Station: {g('station')}",
+        f"FORM_TYPE: {g('form_type')}",
+        "",
+        f"DOCTOR: {g('process_by')}",
+        f"CAPTURED: {g('vital_capture_timestamp')}",    
+       "",
+        "Chief Complaint:",
+        g("complaint"),
+        "",
+        "Initial Diagnosis:",
+        g("initial_diagnosis"),
+        "",
+        "Final Diagnosis:",
+        g("final_diagnosis"),
+        "",
+        "CLINICAL_FINDINGS:",
+        *findings,
+        "",
+        "========================",
+    )
+
+
+def format_opr_vital_vw(row: dict, source: str) -> str:
+    g = lambda key: _get(row, key)
+
+    findings: list[str] = []
+    raw = row.get("vital") or ""
+    if raw:
+        for entry in parse_tag_value_string(str(raw), value_key="measure"):
+            tag   = entry.get("tag", "").strip()
+            value = entry.get("measure", "").strip()
+            if tag:
+                findings.append(f"- {tag}: {value}")
+
+    return _build(
+        "=== Patient Chart ===",
+        "TYPE: Out Patient Record (Temperature, Pulse, Rate) Vital Signs",
+        f"SOURCE_VIEW: {source}",
+        "",
+        f"Patient: {_patient_full_name(row)}",
+        f"Patient Type: {g('patient_type')}",
+        f"Case Classification: {g('case_classification')}",
+        f"OPD/ER: {g('opd_er')}",
+        f"Station: {g('station')}",
+        f"FORM_TYPE: {g('form_type')}",
+        "",
+        f"DOCTOR: {g('process_by')}",
+        f"CAPTURED: {g('vital_capture_timestamp')}",    
+       "",
+        "Chief Complaint:",
+        g("complaint"),
+        "",
+        "Initial Diagnosis:",
+        g("initial_diagnosis"),
+        "",
+        "Final Diagnosis:",
+        g("final_diagnosis"),
+        "",
+        "CLINICAL_FINDINGS:",
+        *findings,
+        "",
+        "========================",
+    )
+
+def format_monitor_vital_vw(row: dict, source: str) -> str:
+    g = lambda key: _get(row, key)
+
+    findings: list[str] = []
+    raw = row.get("vital") or ""
+    if raw:
+        for entry in parse_tag_value_string(str(raw), value_key="measure"):
+            tag   = entry.get("tag", "").strip()
+            value = entry.get("measure", "").strip()
+            if tag:
+                findings.append(f"- {tag}: {value}")
+
+    return _build(
+        "=== Patient Chart ===",
+        "TYPE: Monitoring Vital Signs",
+        f"SOURCE_VIEW: {source}",
+        "",
+        f"Patient: {_patient_full_name(row)}",
+        f"Patient Type: {g('patient_type')}",
+        f"Case Classification: {g('case_classification')}",
+        f"OPD/ER: {g('opd_er')}",
+        f"Station: {g('station')}",
+        f"FORM_TYPE: {g('form_type')}",
+        "",
+        f"DOCTOR: {g('process_by')}",
+        f"CAPTURED: {g('vital_capture_timestamp')}",    
+       "",
+        "Chief Complaint:",
+        g("complaint"),
+        "",
+        "Initial Diagnosis:",
+        g("initial_diagnosis"),
+        "",
+        "Final Diagnosis:",
+        g("final_diagnosis"),
+        "",
+        "CLINICAL_FINDINGS:",
+        *findings,
+        "",
+        "========================",
+    )
+
+
+def format_fluid_intake_outout_vw(row: dict, source: str) -> str:
+    g = lambda key: _get(row, key)
+
+    findings: list[str] = []
+    raw = row.get("vital") or ""
+    if raw:
+        for entry in parse_tag_value_string(str(raw), value_key="measure"):
+            tag   = entry.get("tag", "").strip()
+            value = entry.get("measure", "").strip()
+            if tag:
+                findings.append(f"- {tag}: {value}")
+
+    return _build(
+        "=== Patient Chart ===",
+        "TYPE: Fluid Intake and Output (FIAO)",
         f"SOURCE_VIEW: {source}",
         "",
         f"Patient: {_patient_full_name(row)}",
@@ -341,6 +512,10 @@ _SOURCE_RECORD_TYPE = {
     "_patient_case_medicine_vw":              "MEDICINE_ORDER",
     "_patient_case_medical_consumption_vw":   "MEDICAL_CONSUMPTION",
     "_patient_case_status_vw":               "CASE_STATUS",
+    "_patient_tpr_vw":             "Ward Vital Signs",
+    "_patient_opr_vw":             "Out Patient Vital Signs",
+    "_patient_monitor_vw":             "Monitoring Vital Signs",
+    "_patient_fluid_intake_and_output_vw": "Fluid Intake and Output (FIAO)"
 }
 
 _SOURCE_DATE_FIELD = {
@@ -372,13 +547,18 @@ def build_metadata(row: dict, source: str) -> dict:
 
 _FORMATTERS: dict[str, object] = {
     "_patient_case_doctors_note_vw": format_doctors_note,
-    "_patient_case_vital_vw":        format_vital_vw,
+    "_patient_case_vital_vw":        format_clinical_assessements_vw,
     "_patient_case_diet_vw":         format_diet_vw,
     "_patient_case_nurses_note_vw":  format_nurses_note_vw,
     "_patient_animal_bite_vw":       format_animal_bite_vw,
     "_patient_case_medicine_vw":            format_medicine_vw,
     "_patient_case_medical_consumption_vw": format_medical_consumption_vw,
     "_patient_case_status_vw":             format_case_status_vw,
+    "_patient_tpr_vw":             format_tpr_vital_vw,
+    "_patient_opr_vw":             format_opr_vital_vw,
+    "_patient_monitor_vw":             format_monitor_vital_vw,
+    "_patient_fluid_intake_and_output_vw": format_fluid_intake_outout_vw
+
 }
 
 

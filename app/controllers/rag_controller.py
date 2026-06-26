@@ -1,3 +1,4 @@
+import uuid as _uuid
 from fastapi import Depends
 from sqlalchemy.orm import Session
 from app.core.database import get_db
@@ -7,10 +8,12 @@ from app.services.rag_service import RAGService
 from app.services.vector_service import VectorService
 from app.schemas.rag import RAGRequest, IngestRequest, SearchRequest, VectorRAGRequest, SyncRequest
 
+# In-memory session store: conversation_id → {"active_patient": "..."}
+_sessions: dict[str, dict] = {}
+
 
 class RAGController:
     @staticmethod
-    # , _: User = Depends(get_current_user)
     def ask(data: RAGRequest, db: Session = Depends(get_db)):
         return RAGService(db, provider=data.provider).ask(data.question)
 
@@ -28,22 +31,16 @@ class RAGController:
 
     @staticmethod
     def ask_vector(data: VectorRAGRequest, db: Session = Depends(get_db)):
-        svc = VectorService(collection_name=data.collection)
+        conv_id = data.conversation_id or str(_uuid.uuid4())
+        if conv_id not in _sessions:
+            _sessions[conv_id] = {}
+        session = _sessions[conv_id]
+
+        svc     = VectorService(collection_name=data.collection)
         history = [{"role": m.role, "content": m.content} for m in data.history]
-        result = svc.ask(data.question, provider=data.provider, history=history)
+        result  = svc.ask(data.question, provider=data.provider, history=history, session=session)
 
-        # if not result.get("context_sufficient", True):
-        #     sql_provider = data.sql_provider or data.provider
-        #     sql_result = RAGService(db, provider=sql_provider).ask(data.question)
-        #     return {
-        #         **result,
-        #         "answer": sql_result["answer"],
-        #         "sql": sql_result.get("sql"),
-        #         "sql_result": sql_result.get("result"),
-        #         "source": "sql",
-        #     }
-
-        return {**result, "source": "vector"}
+        return {**result, "source": "vector", "conversation_id": conv_id}
 
     @staticmethod
     def sync(data: SyncRequest, db: Session = Depends(get_db)):
