@@ -135,7 +135,7 @@ class VectorService:
             "_patient_case_nurses_note_vw",
             "_patient_case_doctors_note_vw",
             "_patient_case_diet_vw",
-            "_patient_animal_bite_vw",
+            # "_patient_animal_bite_vw",
             "_patient_case_medicine_vw",
             "_patient_case_medical_consumption_vw",
             "_patient_case_status_vw",
@@ -162,6 +162,7 @@ class VectorService:
             for row in rows:
                 row_dict      = {col: val for col, val in zip(columns, row)}
                 row_dict_text = {col: val for col, val in row_dict.items() if not self._is_id_column(col)}
+                print(row_dict_text)
                 text_repr     = format_record(row_dict_text, source)
                 texts.append(text_repr)
                 metadatas.append(build_metadata(row_dict, source))
@@ -220,21 +221,16 @@ class VectorService:
     # ── Search ────────────────────────────────────────────────────────────────
 
     _STOPWORDS = {
-        # "patient", "the", "and", "for", "tell", "about", "what", "who",
-        # "give", "show", "find", "get", "his", "her", "this", "that",
-        # "with", "from", "details", "info", "information", "records",
-        # "case", "cases", "me", "all", "how", "its", "are", "was",
-        # "were", "did", "does", "not", "don", "just", "also", "have",
-        # "has", "had", "been", "will", "can", "could", "would", "may",
-        # "might", "should", "please",
-        # "when", "where", "why", "time", "date", "seen", "visit",
-        # "last", "ago", "since", "ever", "year", "month", "week", "day",
-        # "list", "down", "rephrase", "summarize", "describe", "explain",
-        # "latest", "recent", "first", "new", "old", "full",
-        # "medical", "record", "chart", "note", "notes", "order", "orders",
-        # "doctor", "doctors", "nurse", "nurses", "history", "data",
-        # "diagnosis", "complaint", "report", "result", "results",
-        "can", "you", "show", "me"
+        # question / filler words
+        "can", "you", "show", "me", "tell", "give", "find", "get", "list",
+        "what", "who", "when", "where", "why", "how", "please",
+        # structural words that never appear as searchable content in records
+            # "patients", "with", "and", "for", "the", "about",
+            # "all", "this", "that", "these", "those", "his", "her", "him",
+            # "their", "them", "its", "our", "your",
+            # "are", "was", "were", "did", "does", "not", "have", "has", "had",
+            # "been", "will", "could", "would", "may", "might", "should",
+            # "also", "just", "from",
     }
 
     def _build_filter(self, patient_name: str, record_type: str) -> Filter | None:
@@ -262,8 +258,9 @@ class VectorService:
         keyword_query: str = None,
         patient_name: str = "",
         record_type: str = "",
+        min_score: float = 0.75,
     ) -> list[dict]:
-        hard_filter = self._build_filter(patient_name, record_type) if patient_name else None
+        hard_filter = self._build_filter(patient_name, record_type) if (patient_name or record_type) else None
 
         # Semantic search — embed only the clean search intent; hard filter narrows scope
         vector_hits = self.client.query_points(
@@ -275,8 +272,7 @@ class VectorService:
 
         # Keyword search — combine hard filter with stopword-filtered text tokens
         kw_source  = keyword_query if keyword_query is not None else query
-        # and w not in self._STOPWORDS
-        kw_tokens  = [w for w in kw_source.lower().split() if len(w) >= 3 ]
+        kw_tokens  = [w for w in kw_source.lower().split() if len(w) >= 3 and w.lower() not in self._STOPWORDS]
         hard_conds = list(hard_filter.must) if hard_filter else []
 
         keyword_hits = []
@@ -303,10 +299,8 @@ class VectorService:
         seen    = set()
         results = []
 
-        MIN_VECTOR_SCORE = 0.75
-
         for h in vector_hits.points:
-            if h.score < MIN_VECTOR_SCORE:
+            if h.score < min_score:
                 continue
             seen.add(h.id)
             results.append({
@@ -461,12 +455,16 @@ class VectorService:
                 record_type=record_type,
             )
         else:
-            print("no patient")
+            # No patient filter — broader condition search; use lower score threshold
             hits = self.search(
-                question,
+                search_intent,
                 top_k=25,
-                keyword_query=question,
+                keyword_query=search_intent,
+                record_type=record_type,
+                min_score=0.45,
             )
+
+        _GREETING_WORDS = frozenset({"hello", "hi", "hey", "thanks", "thank", "good", "bye", "goodbye", "morning", "afternoon", "evening"})
 
         if not hits:
             if patient_name:
@@ -476,19 +474,29 @@ class VectorService:
                     "answer":   "I don't have enough information to answer that. No matching patient records were found in the system.",
                     "context_sufficient": False,
                 }
-            # No patient context — respond conversationally (greetings, small talk, etc.)
-            system_prompt = (
-                "You are a helpful medical assistant for a hospital system. "
-                "Respond naturally to the user's message. For greetings or small talk, reply politely. "
-                "Do not discuss topics outside the medical domain."
-            )
-            messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
-            answer = self._call_llm(provider, system_prompt, messages)
+            # Only use conversational fallback for short greetings/small talk
+            question_words = set(question.lower().split())
+            is_greeting = bool(question_words & _GREETING_WORDS) and len(question.split()) <= 6
+            if is_greeting:
+                system_prompt = (
+                    "You are a helpful medical assistant for a hospital system. "
+                    "Respond naturally to the user's message. For greetings or small talk, reply politely. "
+                    "Do not discuss topics outside the medical domain."
+                )
+                messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
+                answer = self._call_llm(provider, system_prompt, messages)
+                return {
+                    "question": question,
+                    "context":  [],
+                    "answer":   answer,
+                    "context_sufficient": True,
+                }
+            # Clinical query with no matching records — do not answer from training data
             return {
                 "question": question,
                 "context":  [],
-                "answer":   answer,
-                "context_sufficient": True,
+                "answer":   "No matching patient records were found for your query. Try specifying a patient name or use a more specific medical term.",
+                "context_sufficient": False,
             }
 
         raw_context = "\n\n".join(h["text"] for h in hits)

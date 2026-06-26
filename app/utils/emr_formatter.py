@@ -313,6 +313,24 @@ def format_diet_vw(row: dict, source: str) -> str:
         "========================",
     )
 
+def format_diagnostic_vw(row: dict, source: str) -> str:
+    g = lambda key: _get(row, key, timedelta_as_time=True)
+    return _build(
+        "=== Patient Chart ===",
+        "TYPE: Diagnostics Laboratories and Radiology",
+        f"SOURCE_VIEW: {source}",
+        "",
+        f"Patient: {_patient_full_name(row)}",
+        f"Patient Type: {g('patient_type')}",
+        f"Case Classification: {g('case_classification')}",
+        f"OPD/ER: {g('opd_er')}",
+        f"Station: {g('station')}",
+        "",
+        "Result:",
+        g("diagnostic_result"),
+        "",
+        "========================",
+    )
 
 def format_nurses_note_vw(row: dict, source: str) -> str:
     g = lambda key: _get(row, key)
@@ -515,7 +533,9 @@ _SOURCE_RECORD_TYPE = {
     "_patient_tpr_vw":             "Ward Vital Signs",
     "_patient_opr_vw":             "Out Patient Vital Signs",
     "_patient_monitor_vw":             "Monitoring Vital Signs",
+    "_patient_fluid_intake_and_output_vw": "Fluid Intake and Output (FIAO)",
     "_patient_fluid_intake_and_output_vw": "Fluid Intake and Output (FIAO)"
+
 }
 
 _SOURCE_DATE_FIELD = {
@@ -525,7 +545,7 @@ _SOURCE_DATE_FIELD = {
     "_patient_case_nurses_note_vw":  "nurses_note_date",
     "_patient_animal_bite_vw":                "vital_capture_timestamp",
     "_patient_case_medical_consumption_vw":   "medical_comsumption_date",
-    "_patient_case_status_vw":               "discharge_date",
+    "_patient_diagnostics_vw":               "diagnostics",
 }
 
 
@@ -557,7 +577,8 @@ _FORMATTERS: dict[str, object] = {
     "_patient_tpr_vw":             format_tpr_vital_vw,
     "_patient_opr_vw":             format_opr_vital_vw,
     "_patient_monitor_vw":             format_monitor_vital_vw,
-    "_patient_fluid_intake_and_output_vw": format_fluid_intake_outout_vw
+    "_patient_fluid_intake_and_output_vw": format_fluid_intake_outout_vw,
+    "_patient_diagnostics_vw": format_diagnostic_vw
 
 }
 
