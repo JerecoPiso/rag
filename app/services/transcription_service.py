@@ -23,6 +23,7 @@ def _transcribe_openai(audio_bytes: bytes, filename: str) -> dict:
             response = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
+                language="en",
                 response_format="verbose_json",
             )
         return {
@@ -42,7 +43,7 @@ def _transcribe_faster_whisper(audio_bytes: bytes, filename: str, model_size: st
         tmp_path = tmp.name
     try:
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        segments, info = model.transcribe(tmp_path, beam_size=5)
+        segments, info = model.transcribe(tmp_path, beam_size=5, language="en")
         text = " ".join(seg.text.strip() for seg in segments)
         return {
             "text":     text,

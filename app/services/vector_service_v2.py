@@ -455,6 +455,8 @@ class VectorServiceV2:
     _NON_NAME_STARTS = frozenset({
         "the", "a", "an", "this", "that", "these", "those",
         "our", "their", "your", "my", "its",
+        # pronouns — "do you/he/she have?" should not capture "you"/"he" as name
+        "you", "he", "she", "we", "they",
         # verbs — "patient has/is/was ..."
         "has", "had", "have", "is", "was", "were", "will", "would",
         "can", "could", "should", "may", "might", "does", "did",
@@ -466,6 +468,8 @@ class VectorServiceV2:
         "details", "detail", "information", "info", "chart", "records",
         "record", "file", "history", "data", "case", "medical",
         "summary", "report", "about", "all", "type",
+        # common adverbs / particles that keyword triggers like "show" pick up
+        "only", "just", "please", "also", "me", "any",
     })
 
     _NAME_PATTERNS = [
@@ -495,15 +499,35 @@ class VectorServiceV2:
             re.IGNORECASE,
         ),
 
+        # "do/does/did <Name> have/has" — "do mark jhapet lomeda have laboratories?"
+        re.compile(
+            r'\b(?:do|does|did)\s+([A-Za-z]{3,}(?:\s+[A-Za-z]{2,}){1,3})\s+(?:have|has|had|a|an|any)\b',
+            re.IGNORECASE,
+        ),
+
+        # "<Name> has/have/had/is/was ..." at start — "cherry mae has laboratories"
+        re.compile(
+            r'^([A-Za-z]{3,}(?:\s+[A-Za-z]{2,}){1,3})\s+(?:has|have|had|is|was|were)\b',
+            re.IGNORECASE,
+        ),
+
+        # "<Name> <medical topic>" at start — "mark jhapet lomeda laboratories"
+        re.compile(
+            r'^([A-Za-z]{3,}(?:\s+[A-Za-z]{2,}){1,3})\s+'
+            r'(?:laboratories?|labs?|vitals?|medicines?|prescriptions?|diagnos\w+|'
+            r'treatments?|records?|charts?|history|tests?|results?|orders?|notes?|status)\b',
+            re.IGNORECASE,
+        ),
+
         # Possessive: "Mark Jhapet's ..."
         re.compile(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})'s\b", re.IGNORECASE),
 
-        # Keyword triggers: "records of", "show me", "about", etc.
+        # Keyword triggers: "records of", "show me", "about", "bout" (informal), etc.
         re.compile(
             r'(?:records?\s+of|record\s+of|chart\s+of|file\s+of|history\s+of|'
             r'info(?:rmation)?\s+of|details?\s+of|case\s+of|data\s+of|'
             r'patient\s+(?:chart|record|file|history|info(?:rmation)?)\s+of|'
-            r'about|show(?:\s+me)?|find|for|get)\s+'
+            r'about|bout|show(?:\s+me)?|find|for|get)\s+'
             r'([A-Za-z]{2,}(?:\s+[A-Za-z]{2,}){1,4})',
             re.IGNORECASE,
         ),
@@ -691,6 +715,9 @@ class VectorServiceV2:
             "If the user provides only a patient name, summarize all available medical information "
             "(diagnosis, complaints, treatments, dates). "
             "If the answer cannot be found, say so — never fabricate.\n\n"
+            "Do not repeat the same information multiple times in your response — "
+            "if a value like a date, diagnosis, or medicine already appeared, do not list it again. "
+            "Present each unique fact only once.\n\n"
             f"{history_note}"
             f"Retrieved Context:\n{context}"
         )
