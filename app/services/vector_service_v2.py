@@ -115,7 +115,7 @@ class VectorServiceV2:
             PointStruct(
                 id=str(uuid.uuid5(
                     uuid.NAMESPACE_DNS,
-                    f"{meta.get('source', '')}:{meta.get('case_id', '')}",
+                    f"{meta.get('source', '')}:{meta.get('case_id', '')}:{text}",
                 )),
                 vector=self._embed(text),
                 payload={"text": text, **meta},
