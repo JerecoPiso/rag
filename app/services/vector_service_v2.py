@@ -375,6 +375,49 @@ class VectorServiceV2:
 
         return results
 
+    # ── Context Building ──────────────────────────────────────────────────────
+
+    _SECTION_MARKERS = frozenset({
+        "=== Patient Chart ===",
+        "=== format_doctors_note ===",
+        "========================",
+    })
+    _SECTION_PREFIXES = ("TYPE:", "SOURCE_VIEW:")
+
+    def _build_context(self, hits: list[dict]) -> str:
+        """
+        Join hit texts but emit each non-empty line only once.
+        Structural markers (section headers, separators) are always emitted
+        so the LLM can still distinguish record boundaries.
+        """
+        seen: set[str] = set()
+        parts: list[str] = []
+
+        for h in hits:
+            chunk: list[str] = []
+            for raw_line in h["text"].splitlines():
+                stripped = raw_line.strip()
+                if not stripped:
+                    chunk.append(raw_line)
+                    continue
+                if stripped in self._SECTION_MARKERS or any(
+                    stripped.startswith(p) for p in self._SECTION_PREFIXES
+                ):
+                    chunk.append(raw_line)
+                    continue
+                if stripped in seen:
+                    continue
+                seen.add(stripped)
+                chunk.append(raw_line)
+
+            while chunk and not chunk[-1].strip():
+                chunk.pop()
+
+            if any(l.strip() for l in chunk):
+                parts.append("\n".join(chunk))
+
+        return "\n\n".join(parts)
+
     # ── Answer Generation ─────────────────────────────────────────────────────
 
     _NO_ANSWER_PHRASES = (
@@ -404,7 +447,6 @@ class VectorServiceV2:
 
     _IMPLICIT_REFS = frozenset({
         "he", "she", "they", "his", "her", "him", "their", "them",
-        "it", "this", "that", "these", "those",
     })
     _PATIENT_PHRASES = re.compile(
         r'\b(the patient|that patient|same patient|this patient|the same patient)\b',
@@ -413,6 +455,17 @@ class VectorServiceV2:
     _NON_NAME_STARTS = frozenset({
         "the", "a", "an", "this", "that", "these", "those",
         "our", "their", "your", "my", "its",
+        # verbs — "patient has/is/was ..."
+        "has", "had", "have", "is", "was", "were", "will", "would",
+        "can", "could", "should", "may", "might", "does", "did",
+        # prepositions / relative words — "patient with/who/which ..."
+        "with", "for", "from", "in", "on", "at", "of", "by",
+        "who", "which", "whose",
+        # filler words that appear between a keyword trigger and the actual name
+        # e.g. "show me details of patient <name>" — "details" must be skipped
+        "details", "detail", "information", "info", "chart", "records",
+        "record", "file", "history", "data", "case", "medical",
+        "summary", "report", "about", "all", "type",
     })
 
     _NAME_PATTERNS = [
@@ -426,6 +479,19 @@ class VectorServiceV2:
         # Standalone query: "patient julie quilaquil" (whole message is patient lookup)
         re.compile(
             r'^\s*(?:the\s+)?patient\s+([A-Za-z]{2,}(?:\s+[A-Za-z]{2,}){1,4})\s*[?.!]?\s*$',
+            re.IGNORECASE,
+        ),
+
+        # "patient named <name>" / "is there a patient named <name>"
+        re.compile(
+            r'\bpatient\s+named\s+([A-Za-z]{2,}(?:\s+[A-Za-z]{2,}){1,4})',
+            re.IGNORECASE,
+        ),
+
+        # "patient <Name>" mid-sentence — catches "show me ... of patient mark jhapet"
+        # Placed before keyword triggers so it takes priority.
+        re.compile(
+            r'\bpatient\s+([A-Za-z]{3,}(?:\s+[A-Za-z]{2,}){1,4})\b',
             re.IGNORECASE,
         ),
 
@@ -477,6 +543,20 @@ class VectorServiceV2:
         words = set(question.lower().split())
         return bool(words & self._IMPLICIT_REFS) or bool(self._PATIENT_PHRASES.search(question))
 
+    # Discovery queries ask about a CATEGORY of patients, not a specific one.
+    # Matching these should clear the session so the search runs without a patient filter.
+    _DISCOVERY_PATTERN = re.compile(
+        r'\bpatients\s+(?:with|that|who|which|having|named|diagnosed|admitted)\b'
+        r'|\bpatient\s+that\s+(?:has|have|had)\b'
+        r'|\bpatient\s+who\s+(?:has|have|had|is|was|were)\b'
+        r'|\bother\s+patient\b'
+        r'|\b(?:list|find|show|get|search)\s+(?:all\s+)?patients?\b',
+        re.IGNORECASE,
+    )
+
+    def _is_discovery_query(self, question: str) -> bool:
+        return bool(self._DISCOVERY_PATTERN.search(question))
+
     # ── Ask ───────────────────────────────────────────────────────────────────
 
     _GREETING_WORDS = frozenset({
@@ -503,22 +583,34 @@ class VectorServiceV2:
         patient_id   = session.get("patient_id", "")
         patient_name = session.get("patient_name", "")
 
-        if not patient_id and not patient_name:
-            raw_name = self._extract_name(question)
-            if not raw_name and self._references_active_patient(question):
-                raw_name = self._resolve_from_history(history)
+        raw_name = self._extract_name(question)
 
+        if raw_name:
+            # Explicit name in current question — always resolve and update session.
+            # This allows switching to a different patient mid-conversation.
+            pid, canonical = self._resolve_patient(raw_name)
+            patient_id   = pid
+            patient_name = canonical if canonical else raw_name
+            session["patient_id"]   = patient_id
+            session["patient_name"] = patient_name
+        elif self._is_discovery_query(question):
+            # Cross-patient discovery query ("patients with X", "patient that has X",
+            # "other patient") — clear session and search across all patients.
+            patient_id = ""
+            patient_name = ""
+            session["patient_id"]   = ""
+            session["patient_name"] = ""
+        elif not patient_id and not patient_name:
+            # No session patient and no explicit name — try implicit reference.
+            if self._references_active_patient(question):
+                raw_name = self._resolve_from_history(history)
             if raw_name:
-                # Try to get exact patient_id from Qdrant metadata
                 pid, canonical = self._resolve_patient(raw_name)
-                if pid:
-                    patient_id   = pid
-                    patient_name = canonical
-                else:
-                    # patient_id not in metadata — store name for text-based filtering
-                    patient_name = raw_name
+                patient_id   = pid
+                patient_name = canonical if canonical else raw_name
                 session["patient_id"]   = patient_id
                 session["patient_name"] = patient_name
+        # else: session patient stays (implicit follow-up like "what else did he take?")
 
         query_text = search_intent or question
 
@@ -583,7 +675,7 @@ class VectorServiceV2:
             }
 
         # ── Step 5: Generate answer ───────────────────────────────────────────
-        raw_context = "\n\n".join(h["text"] for h in hits)
+        raw_context = self._build_context(hits)
         context     = raw_context[:self._MAX_CTX_CHARS]
 
         history_note = (
