@@ -636,7 +636,16 @@ class VectorServiceV2:
                 session["patient_name"] = patient_name
         # else: session patient stays (implicit follow-up like "what else did he take?")
 
-        query_text = search_intent or question
+        # When no specific medical intent was found (generic "show me the record of...")
+        # and a patient is known, use the patient name as the vector query.
+        # This mirrors exactly what happens when the user types just the name alone,
+        # which produces high semantic similarity against that patient's records.
+        if search_intent:
+            query_text = search_intent
+        elif patient_name:
+            query_text = patient_name
+        else:
+            query_text = question
 
         print(f"[ASK] question={question!r}")
         print(f"[ASK] patient_id={patient_id!r}  patient_name={patient_name!r}  "
@@ -648,7 +657,7 @@ class VectorServiceV2:
         if has_patient:
             hits = self.search(
                 query_text,
-                top_k=25,
+                top_k=50,
                 keyword_query=query_text,
                 patient_id=patient_id,
                 patient_name=patient_name,
@@ -658,7 +667,7 @@ class VectorServiceV2:
         else:
             hits = self.search(
                 query_text,
-                top_k=25,
+                top_k=50,
                 keyword_query=query_text,
                 record_type=record_type,
                 min_score=0.45,
@@ -699,6 +708,13 @@ class VectorServiceV2:
             }
 
         # ── Step 5: Generate answer ───────────────────────────────────────────
+        # Sort by date descending so the LLM sees the most recent records first.
+        # This is critical for "last time seen" / "most recent" queries.
+        hits = sorted(
+            hits,
+            key=lambda h: str(h.get("metadata", {}).get("date", "") or ""),
+            reverse=True,
+        )
         raw_context = self._build_context(hits)
         context     = raw_context[:self._MAX_CTX_CHARS]
 

@@ -531,23 +531,30 @@ _SOURCE_RECORD_TYPE = {
 }
 
 _SOURCE_DATE_FIELD = {
-    "_patient_case_doctors_note_vw": "doctors_note_date",
-    "_patient_case_vital_vw":        "vital_capture_timestamp",
-    "_patient_case_diet_vw":         "diet_date",
-    "_patient_case_nurses_note_vw":  "nurses_note_date",
+    "_patient_case_doctors_note_vw":          "doctors_note_date",
+    "_patient_case_vital_vw":                 "vital_capture_timestamp",
+    "_patient_case_diet_vw":                  "diet_date",
+    "_patient_case_nurses_note_vw":           "nurses_note_date",
     "_patient_animal_bite_vw":                "vital_capture_timestamp",
+    "_patient_case_medicine_vw":              "medicine_date",
     "_patient_case_medical_consumption_vw":   "medical_comsumption_date",
-    "_patient_diagnostics_vw":               "diagnostics",
+    "_patient_case_status_vw":                "discharge_date",
+    "_patient_tpr_vw":                        "vital_capture_timestamp",
+    "_patient_opr_vw":                        "vital_capture_timestamp",
+    "_patient_monitor_vw":                    "vital_capture_timestamp",
+    "_patient_fluid_intake_and_output_vw":    "vital_capture_timestamp",
+    "_patient_diagnostics_vw":                "vital_capture_timestamp",
 }
 
 
 def build_metadata(row: dict, source: str) -> dict:
+    date_field = _SOURCE_DATE_FIELD.get(source, "")
     base = {
         "source":       source,
         "record_type":  _SOURCE_RECORD_TYPE.get(source, "UNKNOWN"),
         "patient_name": _patient_full_name(row),
         "doctor":       str(row.get("process_by") or ""),
-        # "date":         str(row.get(_SOURCE_DATE_FIELD.get(source, ""), "") or ""),
+        "date":         str(row.get(date_field, "") or ""),
     }
     base.update({k: str(v) for k, v in row.items()})
     return base
