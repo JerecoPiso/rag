@@ -11,7 +11,7 @@ from qdrant_client.models import (
 )
 from fastapi import HTTPException
 from app.core.config import settings
-from app.utils.emr_formatter import format_record, build_metadata
+from app.utils.emr_formatter import format_record, build_metadata, _SOURCE_DATE_FIELD
 
 
 class VectorServiceV2:
@@ -189,6 +189,9 @@ class VectorServiceV2:
         system = (
             "You are a query analyzer for a hospital EMR system.\n"
             "Given a question, extract:\n"
+            "- patient_name: the full name of the patient mentioned IN THIS QUESTION ONLY "
+            "(first, middle, and last name if present). "
+            "Return null if no patient name is explicitly in the question text.\n"
             "- search_intent: the core MEDICAL condition, symptom, or topic — "
             "remove filler words AND remove patient names. "
             "Generic phrases like 'medical record', 'patient chart', 'medical history', "
@@ -204,21 +207,22 @@ class VectorServiceV2:
             "  CASE_STATUS         → explicitly asks for admission, discharge, case status\n\n"
             "Generic phrases like 'medical record', 'patient chart', 'history' are NOT a record_type — use null.\n\n"
             "Respond in JSON only:\n"
-            '{"search_intent": "...", "record_type": "..."}\n'
+            '{"patient_name": "...", "search_intent": "...", "record_type": "..."}\n'
             "Use null when a field is not applicable."
         )
         try:
             raw = self._call_llm(provider, system, [{"role": "user", "content": question}], temperature=0).strip()
             raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
             raw = re.sub(r"\s*```$", "", raw)
-            data          = json.loads(raw)
-            search_intent = (data.get("search_intent") or "").strip()
-            record_type   = (data.get("record_type")   or "").strip().upper()
+            data              = json.loads(raw)
+            patient_name_hint = (data.get("patient_name") or "").strip()
+            search_intent     = (data.get("search_intent") or "").strip()
+            record_type       = (data.get("record_type")   or "").strip().upper()
             if record_type not in self._VALID_RECORD_TYPES:
                 record_type = ""
-            return {"search_intent": search_intent, "record_type": record_type}
+            return {"patient_name_hint": patient_name_hint, "search_intent": search_intent, "record_type": record_type}
         except Exception:
-            return {"search_intent": "", "record_type": ""}
+            return {"patient_name_hint": "", "search_intent": "", "record_type": ""}
 
     # ── Patient Resolution ────────────────────────────────────────────────────
 
@@ -374,6 +378,21 @@ class VectorServiceV2:
                 })
 
         return results
+
+    # ── Date Extraction ───────────────────────────────────────────────────────
+
+    def _hit_date(self, hit: dict) -> str:
+        """Return the best available date string for sorting (descending = newest first).
+        Tries the unified 'date' field first (populated after re-sync), then falls
+        back to the source-specific column already stored in the metadata payload.
+        """
+        meta = hit.get("metadata", {})
+        d = str(meta.get("date", "") or "")
+        if d and d not in ("None", "N/A", "none"):
+            return d
+        source = meta.get("source", "")
+        field  = _SOURCE_DATE_FIELD.get(source, "")
+        return str(meta.get(field, "") or "") if field else ""
 
     # ── Context Building ──────────────────────────────────────────────────────
 
@@ -599,15 +618,21 @@ class VectorServiceV2:
             session = {}
 
         # ── Step 1: Decompose query ───────────────────────────────────────────
-        decomposed    = self._decompose_query(question, provider)
-        search_intent = decomposed["search_intent"]
-        record_type   = decomposed["record_type"]
+        decomposed        = self._decompose_query(question, provider)
+        search_intent     = decomposed["search_intent"]
+        record_type       = decomposed["record_type"]
+        patient_name_hint = decomposed["patient_name_hint"]
 
         # ── Step 2: Resolve patient ───────────────────────────────────────────
         patient_id   = session.get("patient_id", "")
         patient_name = session.get("patient_name", "")
 
         raw_name = self._extract_name(question)
+
+        # LLM fallback: for embedded names like "when was the last time <Name> was seen"
+        # that no regex pattern covers, use the LLM-extracted name instead.
+        if not raw_name and patient_name_hint and not self._is_discovery_query(question):
+            raw_name = patient_name_hint
 
         if raw_name:
             # Explicit name in current question — always resolve and update session.
@@ -649,7 +674,8 @@ class VectorServiceV2:
 
         print(f"[ASK] question={question!r}")
         print(f"[ASK] patient_id={patient_id!r}  patient_name={patient_name!r}  "
-              f"search_intent={search_intent!r}  record_type={record_type!r}")
+              f"search_intent={search_intent!r}  record_type={record_type!r}  "
+              f"name_hint={patient_name_hint!r}")
 
         # ── Step 3: Search ────────────────────────────────────────────────────
         has_patient = bool(patient_id or patient_name)
@@ -708,13 +734,8 @@ class VectorServiceV2:
             }
 
         # ── Step 5: Generate answer ───────────────────────────────────────────
-        # Sort by date descending so the LLM sees the most recent records first.
-        # This is critical for "last time seen" / "most recent" queries.
-        hits = sorted(
-            hits,
-            key=lambda h: str(h.get("metadata", {}).get("date", "") or ""),
-            reverse=True,
-        )
+        # Sort most-recent-first so the LLM sees the latest records at the top.
+        hits = sorted(hits, key=self._hit_date, reverse=True)
         raw_context = self._build_context(hits)
         context     = raw_context[:self._MAX_CTX_CHARS]
 
@@ -734,6 +755,15 @@ class VectorServiceV2:
             "Do not repeat the same information multiple times in your response — "
             "if a value like a date, diagnosis, or medicine already appeared, do not list it again. "
             "Present each unique fact only once.\n\n"
+            "Date handling rules:\n"
+            "- If the question asks for the 'latest', 'most recent', 'last', or 'newest' record, "
+            "find the entry with the most recent date in the context and use only that.\n"
+            "- If the question asks for the 'first', 'oldest', 'earliest', or 'initial' record, "
+            "find the entry with the oldest date in the context and use only that.\n"
+            "- If the question asks for records on a specific date, return only entries matching that date.\n"
+            "- If multiple records exist and no time preference is stated, present them in "
+            "chronological order from most recent to oldest.\n"
+            "- Always include the date when answering time-sensitive questions.\n\n"
             f"{history_note}"
             f"Retrieved Context:\n{context}"
         )
