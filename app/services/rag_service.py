@@ -71,12 +71,19 @@ class RAGService:
 
     def _generate_sql(self, question: str, schema: str) -> str:
         prompt = (
-            f"Given this database schema:\n\n{schema}\n\n"
+           f"Given this database schema:\n\n{schema}\n\n"
             "Convert the following question to a valid SQL SELECT query.\n"
+            ""
             "STRICT RULES:\n"
             "- Output ONLY a SELECT statement. No INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, or any other statement.\n"
             "- Do NOT use markdown, backticks, or any explanation — raw SQL only.\n"
-            "- The query must begin with SELECT.\n\n"
+            "- The query must begin with SELECT.\n"
+            "- If the question contains a person's name (patient or doctor), do NOT use exact match (=). "
+            "Use LIKE with wildcards instead, e.g. name LIKE '%mark%jhapet%', and match against each "
+            "name part separately combined with AND/OR so partial or misspelled names still match.\n"
+            "- Names in the database may be stored in ALL CAPS — use UPPER() or LOWER() on both sides "
+            "of the LIKE comparison to make matching case-insensitive, e.g. "
+            "LOWER(patient_name) LIKE LOWER('%mark%') AND LOWER(patient_name) LIKE LOWER('%jhapet%').\n\n"
             f"Question: {question}"
         )
         sql = self._call_llm(prompt)

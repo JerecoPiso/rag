@@ -5,3 +5,4 @@ class TranscriptionResponse(BaseModel):
     text:     str
     language: str
     duration: float
+    cost_usd: float | None = None

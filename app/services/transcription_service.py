@@ -26,10 +26,12 @@ def _transcribe_openai(audio_bytes: bytes, filename: str) -> dict:
                 language="en",
                 response_format="verbose_json",
             )
+        duration = round(getattr(response, "duration", 0.0), 2)
         return {
             "text":     response.text,
             "language": getattr(response, "language", None),
-            "duration": round(getattr(response, "duration", 0.0), 2),
+            "duration": duration,
+            "cost_usd": round((duration / 60) * 0.006, 6),  # $0.006 per minute
         }
     finally:
         os.unlink(tmp_path)
