@@ -182,7 +182,7 @@ class VectorServiceV2:
     _VALID_RECORD_TYPES = {
         "DOCTOR_ORDER", "NURSE_NOTE", "DIET_ORDER",
         "VITAL_SIGNS", "ANIMAL_BITE", "MEDICINE",
-        "MEDICAL_CONSUMPTION", "CASE_STATUS",
+        "MEDICAL_CONSUMPTION", "CASE_STATUS", "Ward Vital Signs", "Out Patient Vital Signs", "Monitoring Vital Signs", "Fluid Intake and Output (FIAO)",
     }
 
     def _decompose_query(self, question: str, provider: str) -> dict:
@@ -232,25 +232,51 @@ class VectorServiceV2:
         Uses patient_id keyword field for exact match in subsequent queries.
         Returns ("", "") if patient_id is not stored in the metadata.
         """
-        name_words = {w.lower() for w in name_hint.split() if len(w) >= 3}
-        try:
-            hits = self.client.query_points(
-                collection_name=self.collection_name,
-                query=self._embed(name_hint),
-                limit=5,
-            )
-        except Exception:
+        name_words = [w.lower() for w in name_hint.split() if len(w) >= 3]
+        if not name_words:
             return "", ""
 
-        for h in hits.points:
-            pid       = str(h.payload.get("patient_id") or "").strip()
-            canonical = str(h.payload.get("patient_name") or "").strip()
-            if not pid or pid.lower() in ("none", ""):
-                continue
-            # Confirm the hit is actually about this patient
-            payload_text = (canonical + " " + h.payload.get("text", "")).lower()
-            if any(w in payload_text for w in name_words):
-                return pid, canonical
+        # Strategy 1: keyword search on the patient_name field (most accurate).
+        # Requires ALL name words to appear in the stored patient_name value.
+        try:
+            filter_must = [
+                FieldCondition(key="patient_name", match=MatchText(text=w))
+                for w in name_words
+            ]
+            kw_hits, _ = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=Filter(must=filter_must),
+                limit=5,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for h in kw_hits:
+                pid       = str(h.payload.get("patient_id") or "").strip()
+                canonical = str(h.payload.get("patient_name") or "").strip()
+                if pid and pid.lower() not in ("none", ""):
+                    return pid, canonical
+        except Exception:
+            pass
+
+        # Strategy 2: semantic search fallback.
+        # Requires at least 2 name words (or all if fewer than 2) to match.
+        try:
+            sem_hits = self.client.query_points(
+                collection_name=self.collection_name,
+                query=self._embed(name_hint),
+                limit=10,
+            )
+            min_match = min(2, len(name_words))
+            for h in sem_hits.points:
+                pid       = str(h.payload.get("patient_id") or "").strip()
+                canonical = str(h.payload.get("patient_name") or "").strip()
+                if not pid or pid.lower() in ("none", ""):
+                    continue
+                payload_text = (canonical + " " + h.payload.get("text", "")).lower()
+                if sum(1 for w in name_words if w in payload_text) >= min_match:
+                    return pid, canonical
+        except Exception:
+            pass
 
         return "", ""
 
@@ -272,10 +298,11 @@ class VectorServiceV2:
         """
         must = []
         if patient_name:
-            parts     = [p.lower() for p in patient_name.split() if len(p) >= 3]
-            key_parts = [parts[0]] if len(parts) == 1 else [parts[0], parts[-1]]
-            for part in key_parts:
-                must.append(FieldCondition(key="text", match=MatchText(text=part)))
+            parts = [p.lower() for p in patient_name.split() if len(p) >= 3]
+            if parts:
+                key_parts = [parts[0]] if len(parts) == 1 else [parts[0], parts[-1]]
+                for part in key_parts:
+                    must.append(FieldCondition(key="text", match=MatchText(text=part)))
         if record_type:
             must.append(FieldCondition(key="record_type", match=MatchValue(value=record_type)))
         return Filter(must=must) if must else None
@@ -489,6 +516,12 @@ class VectorServiceV2:
         "summary", "report", "about", "all", "type",
         # common adverbs / particles that keyword triggers like "show" pick up
         "only", "just", "please", "also", "me", "any",
+        # action / query verbs — "show me all doctors order of <name>"
+        "show", "get", "find", "list", "give", "tell", "fetch",
+        # question words
+        "what", "when", "where", "how",
+        # medical titles that start queries but are not patient names
+        "doctors", "doctor", "nurses", "nurse",
     })
 
     _NAME_PATTERNS = [
@@ -571,6 +604,41 @@ class VectorServiceV2:
                 return name
         return ""
 
+    _NUMBER_WORDS: dict[str, int] = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+        "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+    }
+    _NUMBERED_REF_PATTERN = re.compile(
+        r'\bpatient\s+(?:no\.?\s*|number\s*|#\s*)?'
+        r'(\d+|one|two|three|four|five|six|seven|eight|nine|ten'
+        r'|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b',
+        re.IGNORECASE,
+    )
+
+    def _resolve_numbered_patient(self, question: str, history: list[dict]) -> str:
+        """Resolve 'patient no N' / 'patient number two' → actual name from the previous list."""
+        m = self._NUMBERED_REF_PATTERN.search(question)
+        if not m:
+            return ""
+        token = m.group(1).lower()
+        n = int(token) if token.isdigit() else self._NUMBER_WORDS.get(token, 0)
+        if n == 0:
+            return ""
+        for msg in reversed(history):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", "")
+            hit = re.search(
+                rf'(?:^|\n)\s*{n}[.)]\s+([A-Z][A-Za-z]+(?:\s+[A-Za-z]+){{1,5}})',
+                content,
+                re.MULTILINE,
+            )
+            if hit:
+                return hit.group(1).strip()
+        return ""
+
     def _resolve_from_history(self, history: list[dict]) -> str:
         """Scan user messages first (most recent → oldest), then assistant messages."""
         for role in ("user", "assistant"):
@@ -627,12 +695,17 @@ class VectorServiceV2:
         patient_id   = session.get("patient_id", "")
         patient_name = session.get("patient_name", "")
 
-        raw_name = self._extract_name(question)
+        # Numbered reference: "patient no 2" → look up name from previous list in history
+        raw_name = self._resolve_numbered_patient(question, history) or self._extract_name(question)
 
         # LLM fallback: for embedded names like "when was the last time <Name> was seen"
         # that no regex pattern covers, use the LLM-extracted name instead.
+        # Reject pronouns ("he", "she", "they") that Ollama mistakenly returns as names.
         if not raw_name and patient_name_hint and not self._is_discovery_query(question):
-            raw_name = patient_name_hint
+            hint_lower = patient_name_hint.lower().strip()
+            hint_parts = [p for p in patient_name_hint.split() if len(p) >= 3]
+            if hint_parts and hint_lower not in self._IMPLICIT_REFS:
+                raw_name = patient_name_hint
 
         if raw_name:
             # Explicit name in current question — always resolve and update session.

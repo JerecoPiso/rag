@@ -526,7 +526,7 @@ _SOURCE_RECORD_TYPE = {
     "_patient_opr_vw":             "Out Patient Vital Signs",
     "_patient_monitor_vw":             "Monitoring Vital Signs",
     "_patient_fluid_intake_and_output_vw": "Fluid Intake and Output (FIAO)",
-    "_patient_fluid_intake_and_output_vw": "Fluid Intake and Output (FIAO)"
+    # "_patient_fluid_intake_and_output_vw": "Fluid Intake and Output (FIAO)"
 
 }
 

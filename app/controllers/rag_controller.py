@@ -45,5 +45,5 @@ class RAGController:
 
     @staticmethod
     def sync(data: SyncRequest, db: Session = Depends(get_db)):
-        svc = VectorService(collection_name=data.collection)
+        svc = VectorServiceV2(collection_name=data.collection)
         return svc.sync_from_db(db, clear=data.clear)
