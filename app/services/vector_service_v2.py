@@ -307,6 +307,24 @@ class VectorServiceV2:
             must.append(FieldCondition(key="record_type", match=MatchValue(value=record_type)))
         return Filter(must=must) if must else None
 
+    # ── Rank Fusion ───────────────────────────────────────────────────────────
+
+    _RRF_K = 60  # standard smoothing constant from the original RRF paper
+
+    @classmethod
+    def _rrf_fuse(cls, ranked_id_lists: list[list], k: int = None) -> dict:
+        """Combine multiple ranked ID lists into Reciprocal Rank Fusion scores.
+
+        score(d) = sum over lists containing d of 1 / (k + rank(d))
+        A document missing from a list simply contributes nothing for that list.
+        """
+        k = cls._RRF_K if k is None else k
+        scores: dict = {}
+        for ranked_ids in ranked_id_lists:
+            for rank, doc_id in enumerate(ranked_ids, start=1):
+                scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+        return scores
+
     # ── Search ────────────────────────────────────────────────────────────────
 
     _STOPWORDS = frozenset({
@@ -322,6 +340,8 @@ class VectorServiceV2:
         "details", "info", "information",
     })
 
+    _KEYWORD_RANK_CUTOFF = 50  # scroll() match order isn't relevance-ranked; deep hits are noise
+
     def search(
         self,
         query: str,
@@ -331,6 +351,7 @@ class VectorServiceV2:
         patient_name: str = "",
         record_type: str = "",
         min_score: float = 0.60,
+        keyword_rank_cutoff: int = None,
     ) -> list[dict]:
         # Pick the best available filter strategy
         if patient_id:
@@ -382,27 +403,34 @@ class VectorServiceV2:
                     with_vectors=False,
                 )
 
-        seen    = set()
-        results = []
+        # scroll() returns filter matches in storage order, not ranked by relevance —
+        # so keep only the leading slice instead of trusting matches deep in the list.
+        cutoff       = self._KEYWORD_RANK_CUTOFF if keyword_rank_cutoff is None else keyword_rank_cutoff
+        keyword_hits = keyword_hits[:cutoff]
 
-        for h in vector_hits.points:
-            if h.score < min_score:
-                continue
-            seen.add(h.id)
-            results.append({
-                "score": h.score,
-                "text":  h.payload.get("text", ""),
-                "metadata": {k: v for k, v in h.payload.items() if k != "text"},
-            })
+        # Rank fusion — combine the semantic and keyword rankings via RRF instead of
+        # a plain union, so documents found by both signals outrank single-signal hits.
+        vector_ranked = [h for h in vector_hits.points if h.score >= min_score]
+        vector_ids    = [h.id for h in vector_ranked]
+        keyword_ids   = [h.id for h in keyword_hits]
 
+        rrf_scores = self._rrf_fuse([vector_ids, keyword_ids])
+
+        payload_by_id = {}
+        for h in vector_ranked:
+            payload_by_id[h.id] = h.payload
         for h in keyword_hits:
-            if h.id not in seen:
-                seen.add(h.id)
-                results.append({
-                    "score": 1.0,
-                    "text":  h.payload.get("text", ""),
-                    "metadata": {k: v for k, v in h.payload.items() if k != "text"},
-                })
+            payload_by_id.setdefault(h.id, h.payload)
+
+        ranked_ids = sorted(rrf_scores, key=lambda doc_id: rrf_scores[doc_id], reverse=True)
+        results = [
+            {
+                "score": rrf_scores[doc_id],
+                "text":  payload_by_id[doc_id].get("text", ""),
+                "metadata": {k: v for k, v in payload_by_id[doc_id].items() if k != "text"},
+            }
+            for doc_id in ranked_ids
+        ]
 
         return results
 
@@ -428,13 +456,16 @@ class VectorServiceV2:
         "=== format_doctors_note ===",
         "========================",
     })
-    _SECTION_PREFIXES = ("TYPE:", "SOURCE_VIEW:")
+    _SECTION_PREFIXES = ("TYPE:",)
+    _DROP_PREFIXES = ("SOURCE_VIEW:",)
 
     def _build_context(self, hits: list[dict]) -> str:
         """
         Join hit texts but emit each non-empty line only once.
         Structural markers (section headers, separators) are always emitted
-        so the LLM can still distinguish record boundaries.
+        so the LLM can still distinguish record boundaries. Internal-only
+        markers (e.g. SOURCE_VIEW) are dropped entirely so the LLM never
+        sees them and can't echo them back in an answer.
         """
         seen: set[str] = set()
         parts: list[str] = []
@@ -445,6 +476,8 @@ class VectorServiceV2:
                 stripped = raw_line.strip()
                 if not stripped:
                     chunk.append(raw_line)
+                    continue
+                if stripped.startswith(self._DROP_PREFIXES):
                     continue
                 if stripped in self._SECTION_MARKERS or any(
                     stripped.startswith(p) for p in self._SECTION_PREFIXES
@@ -828,6 +861,9 @@ class VectorServiceV2:
             "Do not repeat the same information multiple times in your response — "
             "if a value like a date, diagnosis, or medicine already appeared, do not list it again. "
             "Present each unique fact only once.\n\n"
+            "The retrieved context contains internal structural markers such as 'TYPE:' and "
+            "'SOURCE_VIEW:' lines. These identify the record type and its underlying database "
+            "view for internal use only — never mention, quote, or include them in your answer.\n\n"
             "Date handling rules:\n"
             "- If the question asks for the 'latest', 'most recent', 'last', or 'newest' record, "
             "find the entry with the most recent date in the context and use only that.\n"
