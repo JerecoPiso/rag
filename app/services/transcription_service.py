@@ -1,7 +1,9 @@
 import os
+import base64
 import tempfile
 from openai import OpenAI
 from app.core.config import settings
+from app.services.speech_service import SpeechService
 
 _openai_client: OpenAI | None = None
 
@@ -28,7 +30,7 @@ def _transcribe_openai(audio_bytes: bytes, filename: str) -> dict:
             )
         duration = round(getattr(response, "duration", 0.0), 2)
         return {
-            "text":     response.text,
+            "text":     response.text.lower(),
             "language": getattr(response, "language", None),
             "duration": duration,
             "cost_usd": round((duration / 60) * 0.006, 6),  # $0.006 per minute
@@ -48,7 +50,7 @@ def _transcribe_faster_whisper(audio_bytes: bytes, filename: str, model_size: st
         segments, info = model.transcribe(tmp_path, beam_size=5, language="en")
         text = " ".join(seg.text.strip() for seg in segments)
         return {
-            "text":     text,
+            "text":     text.lower(),
             "language": info.language,
             "duration": round(info.duration, 2),
         }
@@ -65,5 +67,17 @@ class TranscriptionService:
         model_size: str = "base",
     ) -> dict:
         if provider == "faster-whisper":
-            return _transcribe_faster_whisper(audio_bytes, filename, model_size)
-        return _transcribe_openai(audio_bytes, filename)
+            result = _transcribe_faster_whisper(audio_bytes, filename, model_size)
+        else:
+            result = _transcribe_openai(audio_bytes, filename)
+
+        result["audio"] = None
+        if result.get("text"):
+            try:
+                audio_bytes, media_type = SpeechService().synthesize(result["text"])
+                encoded = base64.b64encode(audio_bytes).decode("ascii")
+                result["audio"] = f"data:{media_type};base64,{encoded}"
+            except Exception:
+                pass  # Text transcript still stands even if speech synthesis fails.
+
+        return result

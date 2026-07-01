@@ -1,3 +1,4 @@
+import base64
 import uuid as _uuid
 from fastapi import Depends
 from sqlalchemy.orm import Session
@@ -7,6 +8,7 @@ from app.models.user import User
 from app.services.rag_service import RAGService
 from app.services.vector_service import VectorService
 from app.services.vector_service_v2 import VectorServiceV2
+from app.services.speech_service import SpeechService
 from app.schemas.rag import RAGRequest, IngestRequest, SearchRequest, VectorRAGRequest, SyncRequest
 
 # In-memory session store: conversation_id → {"active_patient": "..."}
@@ -41,7 +43,16 @@ class RAGController:
         history = [{"role": m.role, "content": m.content} for m in data.history]
         result  = svc.ask(data.question, provider=data.provider, history=history, session=session)
 
-        return {**result, "source": "vector", "conversation_id": conv_id}
+        audio = None
+        if result.get("answer"):
+            try:
+                audio_bytes, media_type = SpeechService().synthesize(result["answer"])
+                encoded = base64.b64encode(audio_bytes).decode("ascii")
+                audio = f"data:{media_type};base64,{encoded}"
+            except Exception:
+                pass  # Text answer still stands even if speech synthesis fails.
+
+        return {**result, "source": "vector", "conversation_id": conv_id, "audio": audio}
 
     @staticmethod
     def sync(data: SyncRequest, db: Session = Depends(get_db)):

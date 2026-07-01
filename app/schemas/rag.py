@@ -54,6 +54,7 @@ class VectorRAGResponse(BaseModel):
     answer:          str
     conversation_id: str
     source:          str = "vector"
+    audio:           str | None = None  # data URI (e.g. "data:audio/mpeg;base64,...") of the spoken answer
 
 class SyncRequest(BaseModel):
     collection: str = "rag_documents"
