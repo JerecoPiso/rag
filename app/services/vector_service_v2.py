@@ -714,6 +714,8 @@ class VectorServiceV2:
         provider: str = "ollama",
         history: list[dict] = [],
         session: dict = None,
+        db: Session = None,
+        sql_provider: str = "openai",
     ) -> dict:
         if session is None:
             session = {}
@@ -810,7 +812,7 @@ class VectorServiceV2:
         # ── Step 4: Handle no hits ────────────────────────────────────────────
         if not hits:
             if has_patient:
-                return {
+                return self._maybe_fallback({
                     "question": question,
                     "context":  [],
                     "answer":   (
@@ -819,7 +821,7 @@ class VectorServiceV2:
                         "The patient may not have records of that type in the system."
                     ),
                     "context_sufficient": False,
-                }
+                }, question, history, db, sql_provider)
 
             question_words = set(question.lower().split())
             if question_words & self._GREETING_WORDS and len(question.split()) <= 6:
@@ -832,12 +834,12 @@ class VectorServiceV2:
                 answer   = self._call_llm(provider, system_prompt, messages)
                 return {"question": question, "context": [], "answer": answer, "context_sufficient": True}
 
-            return {
+            return self._maybe_fallback({
                 "question": question,
                 "context":  [],
                 "answer":   "No matching patient records found. Try specifying a patient name.",
                 "context_sufficient": False,
-            }
+            }, question, history, db, sql_provider)
 
         # ── Step 5: Generate answer ───────────────────────────────────────────
         # Sort most-recent-first so the LLM sees the latest records at the top.
@@ -859,6 +861,7 @@ class VectorServiceV2:
             "(diagnosis, complaints, treatments, dates). "
             "If the answer cannot be found, say so — never fabricate.\n\n"
             "Do not repeat the same information multiple times in your response — "
+            "Only include information that directly answers the user's question. Ignore retrieved context that is unrelated to the question, even if it belongs to the same patient. Do not mention, summarize, or include unrelated diagnoses, treatments, medications, laboratory results, notes, or other medical records."
             "if a value like a date, diagnosis, or medicine already appeared, do not list it again. "
             "Present each unique fact only once.\n\n"
             "The retrieved context contains internal structural markers such as 'TYPE:' and "
@@ -880,11 +883,59 @@ class VectorServiceV2:
         messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
         answer   = self._call_llm(provider, system_prompt, messages)
 
-        return {
+        return self._maybe_fallback({
             "question": question,
             "context":  hits,
             "answer":   answer,
             "context_sufficient": self._context_has_answer(answer),
+        }, question, history, db, sql_provider)
+
+    # ── SQL Fallback ─────────────────────────────────────────────────────────
+    # When the vector/EMR-chunk search can't answer the question, fall back to
+    # text-to-SQL against the live database so the same question (plus the
+    # conversation so far, for pronoun/patient-reference resolution) still
+    # gets a shot at an answer.
+
+    def _maybe_fallback(
+        self,
+        result: dict,
+        question: str,
+        history: list[dict],
+        db: Session | None,
+        sql_provider: str,
+    ) -> dict:
+        if result.get("context_sufficient") or db is None:
+            return result
+        fallback = self._fallback_to_sql(question, history, db, sql_provider)
+        return fallback if fallback is not None else result
+
+    def _fallback_to_sql(
+        self,
+        question: str,
+        history: list[dict],
+        db: Session,
+        sql_provider: str,
+    ) -> dict | None:
+        from app.services.rag_service import RAGService
+        try:
+            sql_result = RAGService(db, provider=sql_provider).ask(question, history=history)
+        except Exception as e:
+            print(f"[ASK] SQL fallback failed: {e}")
+            return None
+
+        print(f"[ASK] SQL fallback sql={sql_result.get('sql')!r} rows={len(sql_result.get('result', []))}")
+
+        rows = sql_result.get("result", [])
+        return {
+            "question": question,
+            "context": [
+                {"score": 1.0, "text": json.dumps(row, default=str), "metadata": row}
+                for row in rows
+            ],
+            "answer": sql_result.get("answer", ""),
+            "context_sufficient": bool(rows) or bool(sql_result.get("answer")),
+            "sql": sql_result.get("sql", ""),
+            "source": "sql",
         }
 
     # ── LLM Dispatch ─────────────────────────────────────────────────────────
@@ -902,7 +953,7 @@ class VectorServiceV2:
                 model="gpt-4o", max_tokens=1024, temperature=temperature,
                 messages=[{"role": "system", "content": system_prompt}] + messages,
             )
-            return r.choices[0].message.content.strip()
+            return r.choices[0].message.content.strip() 
 
         elif provider == "anthropic":
             import anthropic

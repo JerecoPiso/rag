@@ -3,13 +3,14 @@ from typing import Any, Literal, List
 
 class RAGRequest(BaseModel):
     question: str
-    provider: Literal["openai", "anthropic", "google", "ollama"] = "google"
+    provider: Literal["openai", "anthropic", "google", "ollama"] = "openai"
 
 class RAGResponse(BaseModel):
     question: str
     sql:      str
     result:   list[dict[str, Any]]
     answer:   str
+    audio:    str | None = None  # data URI (e.g. "data:audio/mpeg;base64,...") of the spoken answer
 
 # --- Qdrant vector schemas ---
 
