@@ -1,4 +1,5 @@
 import base64
+import re
 import uuid as _uuid
 from fastapi import Depends
 from sqlalchemy.orm import Session
@@ -7,15 +8,36 @@ from app.core.security import get_current_user
 from app.models.user import User
 from app.services.rag_service import RAGService
 from app.services.vector_service import VectorService
-from app.services.vector_service_v2 import VectorServiceV2
 from app.services.speech_service import SpeechService
 from app.schemas.rag import RAGRequest, IngestRequest, SearchRequest, VectorRAGRequest, SyncRequest
 
 # In-memory session store: conversation_id → {"active_patient": "..."}
 _sessions: dict[str, dict] = {}
 
+# Questions asking for a count/total of admitted, outpatient, ER, or discharged
+# patients are answered more reliably by RAGService's text-to-SQL path (which
+# knows about patient_status / discharge_type) than by the vector search path.
+_COUNT_PATTERN  = re.compile(r"\b(?:count|how many|number of|total)\b", re.IGNORECASE)
+_STATUS_PATTERN = re.compile(
+    r"\b(?:admit(?:ted)?|outpatient|opd|inpatient|inp|er|emergency|discharg\w*"
+    r"|medicine||medical|pedia\w*|\bob\b|newborn|new born|surger\w*|classification|patient type)\b",
+    re.IGNORECASE,
+)
+_LATEST_PATTERN = re.compile(
+    r"\b(?:latest|last|most recent|newest|current|recent)\b",
+    re.IGNORECASE,
+)
+
 
 class RAGController:
+    @staticmethod
+    def _is_status_count_question(question: str) -> bool:
+        return bool(_COUNT_PATTERN.search(question) and _STATUS_PATTERN.search(question))
+
+    @staticmethod
+    def _is_latest_question(question: str) -> bool:
+        return bool(_LATEST_PATTERN.search(question))
+    
     @staticmethod
     def ask(data: RAGRequest, db: Session = Depends(get_db)):
         result = RAGService(db, provider=data.provider).ask(data.question)
@@ -50,16 +72,26 @@ class RAGController:
             _sessions[conv_id] = {}
         session = _sessions[conv_id]
 
-        svc     = VectorServiceV2(collection_name=data.collection)
         history = [{"role": m.role, "content": m.content} for m in data.history]
-        result  = svc.ask(
-            data.question,
-            provider=data.provider,
-            history=history,
-            session=session,
-            db=db,
-            sql_provider=data.sql_provider or "openai",
-        )
+
+        if RAGController._is_status_count_question(data.question) or RAGController._is_latest_question(data.question):
+            sql_result = RAGService(db, provider=data.sql_provider or "openai").ask(data.question, history)
+            result = {
+                "question": sql_result["question"],
+                "context":  [],
+                "answer":   sql_result["answer"],
+                "source":   "sql",
+            }
+        else:
+            svc    = VectorService(collection_name=data.collection)
+            result = svc.ask(
+                data.question,
+                provider=data.provider,
+                history=history,
+                session=session,
+                db=db,
+                sql_provider=data.sql_provider or "openai",
+            )
 
         audio = None
 
@@ -76,5 +108,5 @@ class RAGController:
 
     @staticmethod
     def sync(data: SyncRequest, db: Session = Depends(get_db)):
-        svc = VectorServiceV2(collection_name=data.collection)
+        svc = VectorService(collection_name=data.collection)
         return svc.sync_from_db(db, clear=data.clear)

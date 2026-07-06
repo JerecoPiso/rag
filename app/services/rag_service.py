@@ -56,6 +56,7 @@ class RAGService:
             response = self.client.chat(
                 model=settings.OLLAMA_LLM_MODEL,
                 messages=[{"role": "user", "content": prompt}],
+                options={"num_ctx": 25000 },
             )
             return response.message.content.strip()
 
@@ -122,7 +123,19 @@ class RAGService:
             "name part separately combined with AND/OR so partial or misspelled names still match.\n"
             "- Names in the database may be stored in ALL CAPS — use UPPER() or LOWER() on both sides "
             "of the LIKE comparison to make matching case-insensitive, e.g. "
-            "LOWER(patient_name) LIKE LOWER('%mark%') AND LOWER(patient_name) LIKE LOWER('%jhapet%').\n\n"
+            "LOWER(patient_name) LIKE LOWER('%mark%') AND LOWER(patient_name) LIKE LOWER('%jhapet%').\n"
+            "- If the question asks for a count of admitted, outpatient, or ER/emergency consultation "
+            "patients, use the `patient_status` column on `_patient_case_status_vw`: "
+            "'INP' = admitted, 'OPD' = outpatient, 'ER' = ER consultation.\n"
+            "- If the question asks for a count of discharges (e.g. 'discharged today', 'discharged "
+            "this week'), filter on the `discharge_date` column to select the relevant day(s), and use "
+            "the `discharge_type` column to identify records that represent an actual discharge.\n"
+            "- If the question asks for a count by case classification (e.g. 'medicine', 'pedia', "
+            "'ob', 'newborn', 'new born', 'surgery'), filter on the `case_classification` column, and use the "
+            "`patient_type` column when the question also distinguishes patient type. Values in "
+            "`case_classification` may be prefixed with the patient type, e.g. 'OPD Surgery', "
+            "'OPD Medicine', 'OPD Pedia' — so match with LIKE '%surgery%' (case-insensitive) rather "
+            "than an exact match, unless the question explicitly asks to exclude OPD/other prefixes.\n\n"
             f"{correction_block}"
             f"Question: {question}"
         )
