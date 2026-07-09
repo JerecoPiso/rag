@@ -536,6 +536,7 @@ class VectorService:
         "our", "their", "your", "my", "its",
         # pronouns — "do you/he/she have?" should not capture "you"/"he" as name
         "you", "he", "she", "we", "they",
+        "her", "him", "his", "them", "it",
         # verbs — "patient has/is/was ..."
         "has", "had", "have", "is", "was", "were", "will", "would",
         "can", "could", "should", "may", "might", "does", "did",
@@ -631,7 +632,7 @@ class VectorService:
                 continue
             name  = m.group(1).strip().rstrip("'s").strip()
             parts = name.split()
-            if not parts or parts[0].lower() in self._NON_NAME_STARTS:
+            if not parts or any(p.lower() in self._NON_NAME_STARTS for p in parts):
                 continue
             if len(parts) >= 2 or (len(parts) == 1 and len(parts[0]) >= 4):
                 return name
@@ -736,7 +737,16 @@ class VectorService:
         # LLM fallback: for embedded names like "when was the last time <Name> was seen"
         # that no regex pattern covers, use the LLM-extracted name instead.
         # Reject pronouns ("he", "she", "they") that Ollama mistakenly returns as names.
-        if not raw_name and patient_name_hint and not self._is_discovery_query(question):
+        # Also reject the hint outright when a patient is already active in session and
+        # the question is only an implicit follow-up (pronoun / "the patient ...") — the
+        # decompose LLM sometimes hallucinates a name for such questions even though it
+        # was told to return null, which would otherwise hijack the session mid-conversation.
+        already_has_patient = bool(patient_id or patient_name)
+        is_implicit_followup = self._references_active_patient(question)
+        if (
+            not raw_name and patient_name_hint and not self._is_discovery_query(question)
+            and not (already_has_patient and is_implicit_followup)
+        ):
             hint_lower = patient_name_hint.lower().strip()
             hint_parts = [p for p in patient_name_hint.split() if len(p) >= 3]
             if hint_parts and hint_lower not in self._IMPLICIT_REFS:
@@ -897,11 +907,28 @@ class VectorService:
              "You are a helpful medical assistant for a hospital information system.\n\n"
 
             "General Rules:\n"
-                "- Answer only using the retrieved context and conversation history.\n"
-                "- Never fabricate, infer, or assume information that is not explicitly present.\n"
+                # "- Answer only using the retrieved context and conversation history.\n"
+                "- Answer only using the retrieved context.\n"
+                "- Never fabricate, infer, or assume patient facts (diagnosis, medications, vitals, dates, findings) "
+                "that are not explicitly present in the retrieved context. This restriction does not apply to "
+                "treatment recommendations, which may draw on general medical knowledge as described in the "
+                "Treatment Recommendation Rule below.\n"
                 "- If the requested information cannot be found, clearly state that it is not available in the retrieved records.\n"
                 "- Do not answer questions outside the medical domain.\n"
                 "- Do not begin responses with phrases such as 'According to the context' or 'Based on the provided context.'\n\n"
+
+            "Treatment Recommendation Rule:\n"
+                "- If the user asks for a treatment recommendation, suggestion, or guidance (e.g. 'recommend a "
+                "treatment', 'what should be done', 'base it on your knowledge'), you may combine the patient's "
+                "documented diagnosis, findings, and current treatment from the retrieved context with general "
+                "medical knowledge to suggest an appropriate treatment approach.\n"
+                "- Ground the suggestion in the patient's actual documented diagnosis and findings — never invent "
+                "a diagnosis or finding that is not in the retrieved context.\n"
+                "- Do not refuse a treatment recommendation question solely because it calls for clinical judgment "
+                "beyond the literal retrieved text.\n"
+                "- Present the recommendation as guidance for a licensed healthcare professional to review and "
+                "confirm, not as a final medical order — end such answers with a brief note that it should be "
+                "reviewed and confirmed by the attending physician before acting on it.\n\n"
 
             "Relevance Rules:\n"
                 "- Determine the user's intent before answering.\n"
@@ -916,6 +943,7 @@ class VectorService:
                 "- If the user asks for admissions, return only admission-related information.\n"
                 "- Do not include additional facts simply because they are available in the retrieved context.\n"
                 "- When the answer can be expressed as Yes or No, answer Yes or No first, followed only by the minimal supporting information needed to answer the question.\n"
+                "- Exception: if the question asks about death, dying, mortality, prognosis, survival, or a percentage/probability/chance/risk of something occurring, do NOT answer with a direct 'Yes' or a bare percentage. Instead, state only the factual information present in the retrieved context (e.g. documented status, recorded findings) without predicting, estimating, or affirming an outcome that isn't explicitly recorded.\n"
                 "- Return the smallest amount of information necessary to accurately answer the user's question.\n\n"
             "Answer Style:\n"
                 "- Answer naturally and directly.\n"
@@ -933,7 +961,13 @@ class VectorService:
                 "    Answer: 'Yes. The patient is currently admitted.'\n"
                 "  - User: 'Does John Doe exist?'\n"
                 "    Answer: 'Yes. John Doe exists.'\n"
-                "- Do not mention or imply that the information comes from retrieved records, retrieved context, source documents, conversation history, a database, or any internal system.\n"
+                "  - User: 'Recommend a treatment for him.'\n"
+                "    Answer: 'Given the documented diagnosis of acute gastritis, treatment options to consider "
+                "include a proton pump inhibitor, antiemetics for the vomiting, and IV fluid support for hydration. "
+                "This should be reviewed and confirmed by the attending physician before acting on it.'\n"
+                # "- Do not mention or imply that the information comes from retrieved records, retrieved context, source documents, conversation history, a database, or any internal system.\n"
+                "- Do not mention or imply that the information comes from retrieved records, retrieved context, source documents, a database, or any internal system.\n"
+
                 "- Keep responses concise and limited to the information requested.\n"
                 "- If the requested information is not available, state only that the requested information is not available.\n\n"
     
@@ -949,8 +983,10 @@ class VectorService:
                 "- If the question asks for records on a specific date, return only records matching that date.\n"
                 "- If multiple matching records exist and no time preference is specified, present only the relevant records in chronological order from most recent to oldest.\n"
                 "- Always include dates when they are relevant to the user's question.\n\n"
-            "Never mention or imply that your answer comes from the retrieved context, retrieved records, source documents, conversation history, database, or any internal system. Do not use phrases such as 'According to the retrieved record', 'According to the retrieved records', 'According to the retrieved context', 'According to the context', 'Based on the provided context', 'Based on the retrieved context', 'Based on the records', 'From the source', 'The retrieved information shows', or any similar wording. Instead, answer naturally by stating the information directly.\n\n"
-            f"{history_note}"
+            # "Never mention or imply that your answer comes from the retrieved context, retrieved records, source documents, conversation history, database, or any internal system. Do not use phrases such as 'According to the retrieved record', 'According to the retrieved records', 'According to the retrieved context', 'According to the context', 'Based on the provided context', 'Based on the retrieved context', 'Based on the records', 'From the source', 'The retrieved information shows', or any similar wording. Instead, answer naturally by stating the information directly.\n\n"
+            "Never mention or imply that your answer comes from the retrieved context, retrieved records, source documents, database, or any internal system. Do not use phrases such as 'According to the retrieved record', 'According to the retrieved records', 'According to the retrieved context', 'According to the context', 'Based on the provided context', 'Based on the retrieved context', 'Based on the records', 'From the source', 'The retrieved information shows', or any similar wording. Instead, answer naturally by stating the information directly.\n\n"
+
+            # f"{history_note}"
 
             f"Retrieved Context:\n{context}"
         )
