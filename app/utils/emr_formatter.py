@@ -22,10 +22,10 @@ def parse_tag_value_string(raw: str, value_key: str = "measure") -> list[dict[st
 
 def _patient_full_name(row: dict) -> str:
     parts = [
-        row.get("patient_firstname") or "",
-        row.get("patient_middlename") or "",
-        row.get("patient_lastname") or "",
-        row.get("patient_suffix") or "",
+        row.get("patient_firstname") or row.get("firstname") or "",
+        row.get("patient_middlename") or row.get("middlename") or "",
+        row.get("patient_lastname") or row.get("lastname") or "",
+        row.get("patient_suffix") or row.get("suffix") or "",
     ]
     return " ".join(p for p in parts if str(p).strip())
 
@@ -426,6 +426,7 @@ def format_case_status_vw(row: dict, source: str) -> str:
         f"Chief Complaint: {g('complaint')}",
         f"Initial Diagnosis: {g('initial_diagnosis')}",
         f"Final Diagnosis: {g('final_diagnosis')}",
+        f"Date Admitted or Arrival to Hospital: {g('date_admitted_or_arrival_to_hospital')}",
         "",
         "Discharge:",
         f"  Type: {g('discharge_type')}",
@@ -507,6 +508,53 @@ def format_medicine_vw(row: dict, source: str) -> str:
     )
 
 
+def format_patient_info(row: dict, source: str) -> str:
+    g = lambda key: _get(row, key)
+    address = ", ".join(
+        p for p in (row.get("brgy"), row.get("municipality"), row.get("province"), row.get("country"))
+        if p and str(p).strip()
+    )
+    return _build(
+        "=== Patient Chart ===",
+        "TYPE: PATIENT_INFO (Demographics)",
+        f"SOURCE_VIEW: {source}",
+        "",
+        f"Patient: {_patient_full_name(row)}",
+        f"Hospital No: {g('hims_patient_no')}",
+        f"Birthdate: {g('birthdate')}",
+        f"Gender: {g('gender')}",
+        f"Civil Status: {g('civil_status')}",
+        f"Religion: {g('religion')}",
+        f"Nationality: {g('nationality')}",
+        f"Place of Birth: {g('place_of_birth')}",
+        "",
+        f"Address: {address or 'N/A'}",
+        "",
+        f"Father's Name: {g('fathers_name')}",
+        f"Mother's Name: {g('mothers_name')}",
+        f"Spouse Name: {g('spouse_name')}",
+        f"Contact Number: {g('contact_number')}",
+        "",
+        "========================",
+    )
+
+
+def format_case_summary(row: dict, source: str) -> str:
+    g = lambda key: _get(row, key)
+    return _build(
+        "=== Hospital Census ===",
+        "TYPE: CASE_SUMMARY (Hospital-wide Patient Counts)",
+        f"SOURCE_VIEW: {source}",
+        "",
+        f"Outpatient (OPD) Count: {g('opd_count')}",
+        f"Emergency Room (ER) Count: {g('er_count')}",
+        f"Active Inpatient Count: {g('inp_active_count')}",
+        f"Discharged Inpatient Count: {g('inp_discharged_count')}",
+        "",
+        "========================",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Metadata builder
 # ---------------------------------------------------------------------------
@@ -525,6 +573,8 @@ _SOURCE_RECORD_TYPE = {
     "_patient_monitor_vw":             "Monitoring Vital Signs",
     "_patient_fluid_intake_and_output_vw": "Fluid Intake and Output (FIAO)",
     # "_patient_fluid_intake_and_output_vw": "Fluid Intake and Output (FIAO)"
+    "_patient_info":                "PATIENT_INFO",
+    "_patient_case_summary":        "CASE_SUMMARY",
 
 }
 
@@ -542,11 +592,20 @@ _SOURCE_DATE_FIELD = {
     "_patient_monitor_vw":                    "vital_capture_timestamp",
     "_patient_fluid_intake_and_output_vw":    "vital_capture_timestamp",
     "_patient_diagnostics_vw":                "vital_capture_timestamp",
+    "_patient_info":                          "created_timestamp",
+}
+
+# Views whose row identifier column isn't literally named "patient_id"
+# (e.g. _patient_info's primary key is "key") map to it here so
+# build_metadata can still populate a usable "patient_id" field.
+_SOURCE_ID_FIELD = {
+    "_patient_info": "key",
 }
 
 
 def build_metadata(row: dict, source: str) -> dict:
     date_field = _SOURCE_DATE_FIELD.get(source, "")
+    id_field   = _SOURCE_ID_FIELD.get(source, "")
     base = {
         "source":       source,
         "record_type":  _SOURCE_RECORD_TYPE.get(source, "UNKNOWN"),
@@ -555,6 +614,8 @@ def build_metadata(row: dict, source: str) -> dict:
         "date":         str(row.get(date_field, "") or ""),
     }
     base.update({k: str(v) for k, v in row.items()})
+    if id_field:
+        base["patient_id"] = str(row.get(id_field, "") or "")
     return base
 
 
@@ -575,7 +636,9 @@ _FORMATTERS: dict[str, object] = {
     "_patient_opr_vw":             format_opr_vital_vw,
     "_patient_monitor_vw":             format_monitor_vital_vw,
     "_patient_fluid_intake_and_output_vw": format_fluid_intake_outout_vw,
-    "_patient_diagnostics_vw": format_diagnostic_vw
+    "_patient_diagnostics_vw": format_diagnostic_vw,
+    "_patient_info": format_patient_info,
+    "_patient_case_summary": format_case_summary,
 
 }
 

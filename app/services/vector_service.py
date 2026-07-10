@@ -161,6 +161,8 @@ class VectorService:
             "_patient_monitor_vw",
             "_patient_fluid_intake_and_output_vw",
             "_patient_diagnostics_vw",
+            "_patient_info",
+            "_patient_case_summary"
         ]
 
         total  = 0
@@ -179,6 +181,7 @@ class VectorService:
             for row in rows:
                 row_dict      = {col: val for col, val in zip(columns, row)}
                 row_dict_text = {col: val for col, val in row_dict.items() if not self._is_id_column(col)}
+                print(row_dict_text)
                 text_repr     = format_record(row_dict_text, source)
                 texts.append(text_repr)
                 metadatas.append(build_metadata(row_dict, source))
