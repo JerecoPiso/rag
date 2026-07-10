@@ -26,6 +26,8 @@ class VectorService:
     - _NAME_PATTERNS handles "patient <name>" and "Patient: <name>" formats
     """
 
+    # Initializes Ollama embedding client and Qdrant client, verifies both are reachable,
+    # and ensures the target collection/indexes exist before the service is used.
     def __init__(self, collection_name: str = "rag_documents"):
         if not settings.QDRANT_URL:
             raise HTTPException(status_code=500, detail="QDRANT_URL is not configured")
@@ -53,12 +55,15 @@ class VectorService:
 
     # ── Embedding ─────────────────────────────────────────────────────────────
 
+    # Converts a text string into an embedding vector using the configured Ollama model.
     def _embed(self, text: str) -> list[float]:
         response = self.embed_client.embed(model=settings.OLLAMA_EMBED_MODEL, input=text)
         return response.embeddings[0]
 
     # ── Collection Setup ──────────────────────────────────────────────────────
 
+    # Creates the Qdrant collection if it doesn't already exist (sized from a test embedding),
+    # then makes sure text/keyword payload indexes are in place for filtering and text search.
     def _ensure_collection(self):
         existing = {c.name for c in self.client.get_collections().collections}
         if self.collection_name not in existing:
@@ -99,6 +104,8 @@ class VectorService:
             except Exception:
                 pass
 
+    # Drops the existing collection (if present) and recreates it from scratch —
+    # used before a full re-sync so stale points don't linger.
     def _recreate_collection(self):
         existing = {c.name for c in self.client.get_collections().collections}
         if self.collection_name in existing:
@@ -107,6 +114,8 @@ class VectorService:
 
     # ── Ingest / Sync ─────────────────────────────────────────────────────────
 
+    # Embeds a batch of texts and upserts them into Qdrant as points, using a deterministic
+    # UUID (derived from source/case_id/text) so re-ingesting the same record doesn't duplicate it.
     def ingest(self, texts: list[str], metadatas: list[dict], batch_size: int = 50) -> int:
         if not texts:
             return 0
@@ -126,11 +135,15 @@ class VectorService:
             self.client.upsert(collection_name=self.collection_name, points=points[i:i + batch_size])
         return len(points)
 
+    # Detects ID-like column names (e.g. "id", "patient_id") so they can be excluded
+    # from the human-readable text representation while still being kept in metadata.
     @staticmethod
     def _is_id_column(col: str) -> bool:
         lower = col.strip().lower()
         return lower == "id" or lower.endswith("_id")
 
+    # Pulls every row from each configured MySQL view, formats each row into readable
+    # text plus metadata, and ingests it all into Qdrant — the main DB → vector-store sync job.
     def sync_from_db(self, db: Session, clear: bool = True) -> dict:
         if clear:
             self._recreate_collection()
@@ -185,6 +198,8 @@ class VectorService:
         "MEDICAL_CONSUMPTION", "CASE_STATUS", "Ward Vital Signs", "Out Patient Vital Signs", "Monitoring Vital Signs", "Fluid Intake and Output (FIAO)",
     }
 
+    # Uses an LLM to break a natural-language question into structured parts:
+    # patient name, core medical search intent, and an optional record_type filter.
     def _decompose_query(self, question: str, provider: str) -> dict:
         system = (
             "You are a query analyzer for a hospital EMR system.\n"
@@ -342,6 +357,9 @@ class VectorService:
 
     _KEYWORD_RANK_CUTOFF = 10  # scroll() match order isn't relevance-ranked; deep hits are noise
 
+    # Hybrid search: runs semantic (vector) search and keyword (text-match) search in
+    # parallel, applies patient/record_type filters, then fuses both rankings via RRF
+    # into a single ordered list of results with merged payload/text/score.
     def search(
         self,
         query: str,
@@ -515,6 +533,8 @@ class VectorService:
         "there is no",
     )
 
+    # Heuristic check on the LLM's generated answer — flags it as "no answer" if it
+    # contains any of the known "I couldn't find / not available" style phrases.
     def _context_has_answer(self, answer: str) -> bool:
         lower = answer.lower()
         return not any(phrase in lower for phrase in self._NO_ANSWER_PHRASES)
@@ -625,6 +645,8 @@ class VectorService:
         ),
     ]
 
+    # Runs the ordered list of regex _NAME_PATTERNS against a chunk of text to pull out
+    # a likely patient name, rejecting matches that are just pronouns/filler words.
     def _extract_name(self, text: str) -> str:
         for pattern in self._NAME_PATTERNS:
             m = pattern.search(text)
@@ -684,6 +706,8 @@ class VectorService:
                     return name
         return ""
 
+    # Detects implicit follow-up references to the currently active patient,
+    # e.g. pronouns ("he", "she") or phrases like "the patient"/"same patient".
     def _references_active_patient(self, question: str) -> bool:
         words = set(question.lower().split())
         return bool(words & self._IMPLICIT_REFS) or bool(self._PATIENT_PHRASES.search(question))
@@ -699,8 +723,39 @@ class VectorService:
         re.IGNORECASE,
     )
 
+    # Detects cross-patient "discovery" questions (e.g. "patients with diabetes")
+    # that should search across all patients instead of a single resolved patient.
     def _is_discovery_query(self, question: str) -> bool:
         return bool(self._DISCOVERY_PATTERN.search(question))
+
+    # "Does patient X exist?" style questions — these should get a bare Yes/No
+    # answer, never a full record dump.
+    _EXISTENCE_PATTERN = re.compile(
+        r'\bexist(?:s|ing|ence)?\b'
+        r'|\bis there (?:a|any)\s+patient\b'
+        r'|\bdo(?:es)?\s+you\s+have\s+(?:a|any)\s+patient\b',
+        re.IGNORECASE,
+    )
+
+    def _is_existence_query(self, question: str) -> bool:
+        return bool(self._EXISTENCE_PATTERN.search(question))
+
+    # Strips a leading correction phrase ("i mean", "sorry", "actually", ...)
+    # so a follow-up like "i mean balansi jemar" can be checked against a name.
+    _CORRECTION_PREFIX = re.compile(
+        r'^\s*(?:i\s+meant|i\s+mean|meant|sorry,?|no,?\s*i\s+mean|correction[:,]?|actually)\s+',
+        re.IGNORECASE,
+    )
+
+    def _is_name_only_message(self, question: str, name: str) -> bool:
+        """True when the message is essentially just the patient name (optionally
+        prefixed with a correction phrase), e.g. "i mean balansi jemar" — used to
+        carry an existence-check intent forward across a name correction."""
+        if not name:
+            return False
+        stripped  = self._CORRECTION_PREFIX.sub("", question).strip()
+        remainder = re.sub(re.escape(name), "", stripped, flags=re.IGNORECASE).strip(" .,!?")
+        return len(remainder) <= 2
 
     # ── Ask ───────────────────────────────────────────────────────────────────
 
@@ -709,6 +764,9 @@ class VectorService:
         "bye", "goodbye", "morning", "afternoon", "evening",
     })
 
+    # Main RAG entry point: decomposes the question, resolves/tracks the active patient
+    # across conversation turns, runs the hybrid search, builds context, and generates
+    # a final answer via the LLM — falling back to text-to-SQL when context is insufficient.
     def ask(
         self,
         question: str,
@@ -778,6 +836,37 @@ class VectorService:
                 session["patient_id"]   = patient_id
                 session["patient_name"] = patient_name
         # else: session patient stays (implicit follow-up like "what else did he take?")
+
+        # ── Existence-check tracking ──────────────────────────────────────────
+        # A bare "is patient X exists" should get a Yes/No answer only. A follow-up
+        # that just re-supplies/corrects the name (e.g. "i mean balansi jemar")
+        # carries that same intent forward even though it doesn't repeat "exist" —
+        # otherwise the general system prompt's "user provides only the patient's
+        # name → give the full record" rule takes over and dumps the whole chart.
+        is_existence_query = self._is_existence_query(question)
+        if (
+            not is_existence_query and session.get("pending_existence")
+            and raw_name and self._is_name_only_message(question, raw_name)
+        ):
+            is_existence_query = True
+        session["pending_existence"] = is_existence_query
+
+        if is_existence_query:
+            if patient_id or patient_name:
+                display_name = patient_name or raw_name
+                answer = f"Yes. {display_name} exists."
+            else:
+                display_name = raw_name or patient_name_hint
+                answer = (
+                    f"No, there is no record of a patient named {display_name} in the system."
+                    if display_name else "No patient name was specified to check."
+                )
+            return {
+                "question": question,
+                "context": [],
+                "answer": answer,
+                "context_sufficient": True,
+            }
 
         # When no specific medical intent was found (generic "show me the record of...")
         # and a patient is known, use the patient name as the vector query.
@@ -857,11 +946,11 @@ class VectorService:
         raw_context = self._build_context(hits)
         context     = raw_context[:self._MAX_CTX_CHARS]
 
-        history_note = (
-            "Use the conversation history to resolve follow-up references "
-            "(e.g. 'he', 'she', 'that patient').\n"
-            if history else ""
-        )
+        # history_note = (
+        #     "Use the conversation history to resolve follow-up references "
+        #     "(e.g. 'he', 'she', 'that patient').\n"
+        #     if history else ""
+        # )
         system_prompt = (
              "You are a helpful medical assistant for a hospital information system.\n\n"
 
@@ -874,7 +963,11 @@ class VectorService:
                 "Treatment Recommendation Rule below.\n"
                 "- If the requested information cannot be found, clearly state that it is not available in the retrieved records.\n"
                 "- Do not answer questions outside the medical domain.\n"
-                "- Do not begin responses with phrases such as 'According to the context' or 'Based on the provided context.'\n\n"
+                "- Do not begin responses with phrases such as 'According to the context' or 'Based on the provided context.'\n"
+                "- Never comment on the conversation itself — do not remark that a question was already asked, "
+                "repeated, rephrased, or asked multiple times, and do not add notes, disclaimers, or asides about "
+                "your own answering behavior (e.g. 'Note: since you asked this twice...'). Always answer the "
+                "current question directly and fully, every time it is asked, with no meta-commentary.\n\n"
 
             "Treatment Recommendation Rule:\n"
                 "- If the user asks for a treatment recommendation, suggestion, or guidance (e.g. 'recommend a "
@@ -966,6 +1059,8 @@ class VectorService:
     # conversation so far, for pronoun/patient-reference resolution) still
     # gets a shot at an answer.
 
+    # Gatekeeper for the SQL fallback path — only triggers _fallback_to_sql when the
+    # vector-search answer was deemed insufficient and a DB session is available.
     def _maybe_fallback(
         self,
         result: dict,
@@ -979,6 +1074,8 @@ class VectorService:
         fallback = self._fallback_to_sql(question, history, db, sql_provider)
         return fallback if fallback is not None else result
 
+    # Delegates the question to RAGService's text-to-SQL pipeline and reshapes its
+    # result (rows/answer/sql) into the same dict shape the vector-search path returns.
     def _fallback_to_sql(
         self,
         question: str,
@@ -1010,6 +1107,8 @@ class VectorService:
 
     # ── LLM Dispatch ─────────────────────────────────────────────────────────
 
+    # Dispatches a chat completion request to whichever LLM provider is configured
+    # (openai, anthropic, google, or local ollama) and returns the plain text response.
     def _call_llm(
         self,
         provider: str,
