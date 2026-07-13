@@ -9,7 +9,7 @@ from app.models.user import User
 from app.services.rag_service import RAGService
 from app.services.vector_service import VectorService
 from app.services.speech_service import SpeechService
-from app.schemas.rag import RAGRequest, IngestRequest, SearchRequest, VectorRAGRequest, SyncRequest
+from app.schemas.rag import RAGRequest, IngestRequest, SearchRequest, VectorRAGRequest, SyncRequest, SyncLatestRequest
 
 # In-memory session store: conversation_id → {"active_patient": "..."}
 _sessions: dict[str, dict] = {}
@@ -110,3 +110,8 @@ class RAGController:
     def sync(data: SyncRequest, db: Session = Depends(get_db)):
         svc = VectorService(collection_name=data.collection)
         return svc.sync_from_db(db, clear=data.clear)
+
+    @staticmethod
+    def sync_latest(data: SyncLatestRequest, db: Session = Depends(get_db)):
+        svc = VectorService(collection_name=data.collection)
+        return svc.sync_latest(db, since=data.since)

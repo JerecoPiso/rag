@@ -64,3 +64,12 @@ class SyncRequest(BaseModel):
 class SyncResponse(BaseModel):
     total_ingested: int
     sources:        list[dict[str, Any]]
+
+class SyncLatestRequest(BaseModel):
+    since:      str | None = None  # optional override; defaults to setting_tbl's stored last-sync time
+    collection: str = "rag_documents"
+
+class SyncLatestResponse(BaseModel):
+    total_ingested: int
+    sources:        list[dict[str, Any]]
+    since:          str

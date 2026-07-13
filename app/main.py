@@ -1,9 +1,24 @@
+import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.routes.api import router
 from app.core.config import settings
+from app.services.vector_sync_scheduler import run_periodic_vector_sync
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title=settings.APP_NAME)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[LIFESPAN] starting background vector sync task...")
+    task = asyncio.create_task(run_periodic_vector_sync())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
+
+# app = FastAPI(title=settings.APP_NAME)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[

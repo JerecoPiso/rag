@@ -1,6 +1,7 @@
 import re
 import json
 import uuid
+from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sa_text
 from qdrant_client import QdrantClient
@@ -192,6 +193,111 @@ class VectorService:
                 synced.append({"source": source, "rows": len(texts)})
 
         return {"total_ingested": total, "sources": synced}
+
+    # ── Incremental Sync (latest-only) ───────────────────────────────────────
+
+    _DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
+    _SYNC_SETTING_NAME = "vector_last_sync_at"
+
+    # Reads the last-sync timestamp from setting_tbl (name/value pairs).
+    # Returns "" if the setting row doesn't exist yet.
+    def _get_setting(self, db: Session, name: str) -> str:
+        row = db.execute(
+            sa_text("SELECT value FROM setting_tbl WHERE name = :name ORDER BY id DESC LIMIT 1"),
+            {"name": name},
+        ).fetchone()
+        return str(row[0]) if row and row[0] is not None else ""
+
+    # Inserts or updates a setting_tbl row. `name` has no unique constraint in this
+    # table, so a plain upsert isn't available — select-then-branch instead.
+    def _upsert_setting(self, db: Session, name: str, value: str) -> None:
+        row = db.execute(
+            sa_text("SELECT id FROM setting_tbl WHERE name = :name ORDER BY id DESC LIMIT 1"),
+            {"name": name},
+        ).fetchone()
+        if row:
+            db.execute(
+                sa_text("UPDATE setting_tbl SET value = :value WHERE id = :id"),
+                {"value": value, "id": row[0]},
+            )
+        else:
+            db.execute(
+                sa_text("INSERT INTO setting_tbl (name, value) VALUES (:name, :value)"),
+                {"name": name, "value": value},
+            )
+        db.commit()
+
+    _LATEST_SOURCES = [
+        "_patient_case_vital_vw",
+        "_patient_case_nurses_note_vw",
+        "_patient_case_doctors_note_vw",
+        "_patient_case_diet_vw",
+        "_patient_case_medicine_vw",
+        "_patient_case_medical_consumption_vw",
+        "_patient_case_status_vw",
+        "_patient_tpr_vw",
+        "_patient_opr_vw",
+        "_patient_monitor_vw",
+        "_patient_fluid_intake_and_output_vw",
+        "_patient_diagnostics_vw",
+        "_patient_info",
+        "_patient_case_summary",
+    ]
+
+    # Incremental counterpart to sync_from_db(): pulls only rows newer than `since`
+    # from each configured MySQL view (filtered on that view's known date column via
+    # _SOURCE_DATE_FIELD) and upserts them into Qdrant. Never clears the collection —
+    # existing points are left untouched, only new/changed rows are added.
+    #
+    # `since` is optional — when not supplied, it's read from setting_tbl
+    # (name=vector_last_sync_at). If that row doesn't exist yet, it's created with
+    # the current datetime. After the sync runs, the setting is always updated to
+    # "now" so the next run (with no `since` passed) picks up from here.
+    def sync_latest(self, db: Session, since: str = None) -> dict:
+        now_str = datetime.now().strftime(self._DATETIME_FMT)
+
+        if not since:
+            since = self._get_setting(db, self._SYNC_SETTING_NAME)
+        if not since:
+            since = now_str
+            self._upsert_setting(db, self._SYNC_SETTING_NAME, since)
+
+        total  = 0
+        synced = []
+
+        for source in self._LATEST_SOURCES:
+            # date_field = _SOURCE_DATE_FIELD.get(source, "")
+            date_field = "created_timestamp"
+            try:
+                if date_field:
+                    result = db.execute(
+                        sa_text(f"SELECT * FROM `{source}` WHERE `{date_field}` > :since"),
+                        {"since": since},
+                    )
+                else:
+                    result = db.execute(sa_text(f"SELECT * FROM `{source}`"))
+                columns = list(result.keys())
+                rows    = result.fetchall()
+            except Exception:
+                continue
+
+            texts: list[str]      = []
+            metadatas: list[dict] = []
+            for row in rows:
+                row_dict      = {col: val for col, val in zip(columns, row)}
+                row_dict_text = {col: val for col, val in row_dict.items() if not self._is_id_column(col)}
+                text_repr     = format_record(row_dict_text, source)
+                texts.append(text_repr)
+                metadatas.append(build_metadata(row_dict, source))
+
+            if texts:
+                self.ingest(texts, metadatas)
+                total += len(texts)
+                synced.append({"source": source, "rows": len(texts)})
+
+        self._upsert_setting(db, self._SYNC_SETTING_NAME, now_str)
+
+        return {"total_ingested": total, "sources": synced, "since": since}
 
     # ── Query Decomposition ───────────────────────────────────────────────────
 
