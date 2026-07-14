@@ -75,7 +75,7 @@ class RAGService:
     # What each view represents — used to help the LLM pick the right one for a
     # question before SQL is generated, instead of guessing from column names alone.
     _VIEW_DESCRIPTIONS: dict[str, str] = {
-        "_patient_case_vital_vw":               "Clinical assessment / physical examination recorded for a patient case.",
+        "_patient_case_vital_vw":               "Clinical assessment / vital signs recorded for a patient case.",
         "_patient_case_nurses_note_vw":         "Nurses' notes for a patient case.",
         "_patient_case_doctors_note_vw":        "Doctors' notes/orders for a patient case.",
         "_patient_case_diet_vw":                "Diet orders for a patient case.",

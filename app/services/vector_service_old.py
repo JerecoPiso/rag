@@ -27,30 +27,6 @@ class VectorService:
     - _NAME_PATTERNS handles "patient <name>" and "Patient: <name>" formats
     """
 
-    # Every synced MySQL view gets its own Qdrant collection instead of one shared
-    # "rag_documents" collection — keeps each table's vectors isolated.
-    _SOURCES = [
-        "_patient_case_vital_vw",
-        "_patient_case_nurses_note_vw",
-        "_patient_case_doctors_note_vw",
-        "_patient_case_diet_vw",
-        "_patient_case_medicine_vw",
-        "_patient_case_medical_consumption_vw",
-        "_patient_case_status_vw",
-        "_patient_tpr_vw",
-        "_patient_opr_vw",
-        "_patient_monitor_vw",
-        "_patient_fluid_intake_and_output_vw",
-        "_patient_diagnostics_vw",
-        "_patient_info",
-        "_patient_case_summary",
-    ]
-
-    # Maps a source view name to its dedicated Qdrant collection name.
-    @staticmethod
-    def _collection_for_source(source: str) -> str:
-        return source.lstrip("_") or source
-
     # Initializes Ollama embedding client and Qdrant client, verifies both are reachable,
     # and ensures the target collection/indexes exist before the service is used.
     def __init__(self, collection_name: str = "rag_documents"):
@@ -59,7 +35,6 @@ class VectorService:
         from ollama import Client as OllamaClient
         self.embed_client = OllamaClient(host=settings.OLLAMA_URL)
         self.collection_name = collection_name
-        self.view_collections = [self._collection_for_source(s) for s in self._SOURCES]
         try:
             self.client = QdrantClient(url=settings.QDRANT_URL)
             self.client.get_collections()
@@ -69,7 +44,7 @@ class VectorService:
                 detail=f"Cannot connect to Qdrant at {settings.QDRANT_URL}. ({e})"
             )
         try:
-            self._ensure_all_collections()
+            self._ensure_collection()
         except Exception as e:
             msg = str(e)
             if "ollama" in msg.lower() or settings.OLLAMA_URL in msg:
@@ -88,18 +63,20 @@ class VectorService:
 
     # ── Collection Setup ──────────────────────────────────────────────────────
 
-    # Creates a Qdrant collection (sized from a test embedding) and makes sure its
-    # text/keyword payload indexes are in place for filtering and text search.
-    def _create_collection(self, collection_name: str):
-        dim = len(self._embed("test"))
-        try:
-            self.client.create_collection(
-                collection_name=collection_name,
-                vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
-            )
-        except Exception as e:
-            if "already exists" not in str(e).lower():
-                raise
+    # Creates the Qdrant collection if it doesn't already exist (sized from a test embedding),
+    # then makes sure text/keyword payload indexes are in place for filtering and text search.
+    def _ensure_collection(self):
+        existing = {c.name for c in self.client.get_collections().collections}
+        if self.collection_name not in existing:
+            dim = len(self._embed("test"))
+            try:
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+                )
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    raise
 
         text_index = TextIndexParams(
             type="text",
@@ -111,7 +88,7 @@ class VectorService:
         for field in ("text", "patient_name"):
             try:
                 self.client.create_payload_index(
-                    collection_name=collection_name,
+                    collection_name=self.collection_name,
                     field_name=field,
                     field_schema=text_index,
                 )
@@ -121,43 +98,28 @@ class VectorService:
         for field in ("record_type", "patient_id"):
             try:
                 self.client.create_payload_index(
-                    collection_name=collection_name,
+                    collection_name=self.collection_name,
                     field_name=field,
                     field_schema="keyword",
                 )
             except Exception:
                 pass
 
-    # Ensures the generic default collection plus every per-view collection exist.
-    def _ensure_all_collections(self):
-        existing = {c.name for c in self.client.get_collections().collections}
-        names = list(dict.fromkeys([self.collection_name, *self.view_collections]))
-        for name in names:
-            if name not in existing:
-                self._create_collection(name)
-
-    # Drops the given collection (if present) and recreates it from scratch —
+    # Drops the existing collection (if present) and recreates it from scratch —
     # used before a full re-sync so stale points don't linger.
-    def _recreate_collection(self, collection_name: str):
+    def _recreate_collection(self):
         existing = {c.name for c in self.client.get_collections().collections}
-        if collection_name in existing:
-            self.client.delete_collection(collection_name)
-        self._create_collection(collection_name)
+        if self.collection_name in existing:
+            self.client.delete_collection(self.collection_name)
+        self._ensure_collection()
 
     # ── Ingest / Sync ─────────────────────────────────────────────────────────
 
     # Embeds a batch of texts and upserts them into Qdrant as points, using a deterministic
     # UUID (derived from source/case_id/text) so re-ingesting the same record doesn't duplicate it.
-    def ingest(
-        self,
-        texts: list[str],
-        metadatas: list[dict],
-        batch_size: int = 50,
-        collection_name: str = None,
-    ) -> int:
+    def ingest(self, texts: list[str], metadatas: list[dict], batch_size: int = 50) -> int:
         if not texts:
             return 0
-        collection_name = collection_name or self.collection_name
         padded_meta = list(metadatas) + [{}] * (len(texts) - len(metadatas))
         points = [
             PointStruct(
@@ -171,7 +133,7 @@ class VectorService:
             for text, meta in zip(texts, padded_meta)
         ]
         for i in range(0, len(points), batch_size):
-            self.client.upsert(collection_name=collection_name, points=points[i:i + batch_size])
+            self.client.upsert(collection_name=self.collection_name, points=points[i:i + batch_size])
         return len(points)
 
     # Detects ID-like column names (e.g. "id", "patient_id") so they can be excluded
@@ -182,14 +144,32 @@ class VectorService:
         return lower == "id" or lower.endswith("_id")
 
     # Pulls every row from each configured MySQL view, formats each row into readable
-    # text plus metadata, and ingests it into that view's own Qdrant collection —
-    # the main DB → vector-store sync job.
+    # text plus metadata, and ingests it all into Qdrant — the main DB → vector-store sync job.
     def sync_from_db(self, db: Session, clear: bool = True) -> dict:
+        if clear:
+            self._recreate_collection()
+
+        sources = [
+            "_patient_case_vital_vw",
+            "_patient_case_nurses_note_vw",
+            "_patient_case_doctors_note_vw",
+            "_patient_case_diet_vw",
+            "_patient_case_medicine_vw",
+            "_patient_case_medical_consumption_vw",
+            "_patient_case_status_vw",
+            "_patient_tpr_vw",
+            "_patient_opr_vw",
+            "_patient_monitor_vw",
+            "_patient_fluid_intake_and_output_vw",
+            "_patient_diagnostics_vw",
+            "_patient_info",
+            "_patient_case_summary"
+        ]
+
         total  = 0
         synced = []
 
-        for source in self._SOURCES:
-            collection_name = self._collection_for_source(source)
+        for source in sources:
             try:
                 result  = db.execute(sa_text(f"SELECT * FROM `{source}`"))
                 columns = list(result.keys())
@@ -197,22 +177,20 @@ class VectorService:
             except Exception:
                 continue
 
-            if clear:
-                self._recreate_collection(collection_name)
-
             texts: list[str]     = []
             metadatas: list[dict] = []
             for row in rows:
                 row_dict      = {col: val for col, val in zip(columns, row)}
                 row_dict_text = {col: val for col, val in row_dict.items() if not self._is_id_column(col)}
+                print(row_dict_text)
                 text_repr     = format_record(row_dict_text, source)
                 texts.append(text_repr)
                 metadatas.append(build_metadata(row_dict, source))
 
             if texts:
-                self.ingest(texts, metadatas, collection_name=collection_name)
+                self.ingest(texts, metadatas)
                 total += len(texts)
-                synced.append({"source": source, "collection": collection_name, "rows": len(texts)})
+                synced.append({"source": source, "rows": len(texts)})
 
         return {"total_ingested": total, "sources": synced}
 
@@ -249,6 +227,23 @@ class VectorService:
             )
         db.commit()
 
+    _LATEST_SOURCES = [
+        "_patient_case_vital_vw",
+        "_patient_case_nurses_note_vw",
+        "_patient_case_doctors_note_vw",
+        "_patient_case_diet_vw",
+        "_patient_case_medicine_vw",
+        "_patient_case_medical_consumption_vw",
+        "_patient_case_status_vw",
+        "_patient_tpr_vw",
+        "_patient_opr_vw",
+        "_patient_monitor_vw",
+        "_patient_fluid_intake_and_output_vw",
+        "_patient_diagnostics_vw",
+        "_patient_info",
+        "_patient_case_summary",
+    ]
+
     # Incremental counterpart to sync_from_db(): pulls only rows newer than `since`
     # from each configured MySQL view (filtered on that view's known date column via
     # _SOURCE_DATE_FIELD) and upserts them into Qdrant. Never clears the collection —
@@ -270,8 +265,7 @@ class VectorService:
         total  = 0
         synced = []
 
-        for source in self._SOURCES:
-            collection_name = self._collection_for_source(source)
+        for source in self._LATEST_SOURCES:
             # date_field = _SOURCE_DATE_FIELD.get(source, "")
             date_field = "created_timestamp"
             try:
@@ -297,9 +291,9 @@ class VectorService:
                 metadatas.append(build_metadata(row_dict, source))
 
             if texts:
-                self.ingest(texts, metadatas, collection_name=collection_name)
+                self.ingest(texts, metadatas)
                 total += len(texts)
-                synced.append({"source": source, "collection": collection_name, "rows": len(texts)})
+                synced.append({"source": source, "rows": len(texts)})
 
         self._upsert_setting(db, self._SYNC_SETTING_NAME, now_str)
 
@@ -307,31 +301,15 @@ class VectorService:
 
     # ── Query Decomposition ───────────────────────────────────────────────────
 
-    # What each view represents — grounds the LLM's routing decision in what's
-    # actually in each collection, instead of forcing the question into a fixed
-    # category enum that has to be kept in sync with the collections by hand.
-    _VIEW_DESCRIPTIONS: dict[str, str] = {
-        "_patient_case_vital_vw":               "Clinical assessment / physical examination recorded for a patient case.",
-        "_patient_case_nurses_note_vw":         "Nurses' notes for a patient case.",
-        "_patient_case_doctors_note_vw":        "Doctors' notes/orders for a patient case.",
-        "_patient_case_diet_vw":                "Diet orders for a patient case.",
-        "_patient_case_medicine_vw":            "Medicines/prescriptions ordered for a patient case.",
-        "_patient_case_medical_consumption_vw": "Medical supplies/items consumed for a patient case (e.g. IVF, oxygen).",
-        "_patient_case_status_vw":              "Admission/discharge/case status: patient_status (INP/OPD/ER), discharge_date, discharge_type, case_classification, patient_type. And the patient's case (diagnosis, chief complaint, etc.).",
-        "_patient_tpr_vw":                      "Ward vital signs (temperature/pulse/respiration chart) for admitted patients.",
-        "_patient_opr_vw":                      "Out-patient vital signs recorded during an OPD visit.",
-        "_patient_monitor_vw":                  "Continuous monitoring vital signs.",
-        "_patient_fluid_intake_and_output_vw":  "Fluid intake and output (FIAO) tracking.",
-        "_patient_diagnostics_vw":              "Diagnostics/laboratory test results.",
-        "_patient_info":                        "General patient demographic/basic info (name, id, birthdate, address, etc.).",
-        "_patient_case_summary":                "Hospital-wide patient counts (OPD/ER/inpatient active/discharged) — not specific to any one patient.",
+    _VALID_RECORD_TYPES = {
+        "DOCTOR_ORDER", "NURSE_NOTE", "DIET_ORDER",
+        "VITAL_SIGNS", "ANIMAL_BITE", "MEDICINE",
+        "MEDICAL_CONSUMPTION", "CASE_STATUS", "Ward Vital Signs", "Out Patient Vital Signs", "Monitoring Vital Signs", "Fluid Intake and Output (FIAO)",
     }
 
     # Uses an LLM to break a natural-language question into structured parts:
-    # patient name, core medical search intent, and which view(s) (if any) the
-    # question specifically targets.
+    # patient name, core medical search intent, and an optional record_type filter.
     def _decompose_query(self, question: str, provider: str) -> dict:
-        catalog = "\n".join(f"- {source}: {desc}" for source, desc in self._VIEW_DESCRIPTIONS.items())
         system = (
             "You are a query analyzer for a hospital EMR system.\n"
             "Given a question, extract:\n"
@@ -342,17 +320,19 @@ class VectorService:
             "remove filler words AND remove patient names. "
             "Generic phrases like 'medical record', 'patient chart', 'medical history', "
             "'all records', 'information' mean the user wants everything — return null.\n"
-            "- sources: ONLY set when the question explicitly asks for a specific kind of record. "
-            "Given this list of record collections and what each one contains:\n\n"
-            f"{catalog}\n\n"
-            "Return a JSON array of the exact collection name(s), character-for-character as listed "
-            "above, that should be searched to answer the question. Most questions target exactly "
-            "one collection; only include more than one if the question genuinely spans several "
-            "kinds of records. Generic phrases like 'medical record', 'patient chart', 'history', "
-            "or a bare patient name mean the user wants everything — return an empty array [].\n\n"
+            "- record_type: ONLY set when the question explicitly asks for a specific type:\n"
+            "  DOCTOR_ORDER        → explicitly asks for doctors orders or doctors notes\n"
+            "  NURSE_NOTE          → explicitly asks for nurses notes\n"
+            "  DIET_ORDER          → explicitly asks for diet orders\n"
+            "  VITAL_SIGNS         → explicitly asks for vitals, BP, temperature, weight\n"
+            "  ANIMAL_BITE         → explicitly asks for animal bite records\n"
+            "  MEDICINE            → explicitly asks for medicines, prescriptions\n"
+            "  MEDICAL_CONSUMPTION → explicitly asks for consumed/given medicines (IVF, oxygen)\n"
+            "  CASE_STATUS         → explicitly asks for admission, discharge, case status\n\n"
+            "Generic phrases like 'medical record', 'patient chart', 'history' are NOT a record_type — use null.\n\n"
             "Respond in JSON only:\n"
-            '{"patient_name": "...", "search_intent": "...", "sources": [...]}\n'
-            "Use null for patient_name/search_intent when not applicable."
+            '{"patient_name": "...", "search_intent": "...", "record_type": "..."}\n'
+            "Use null when a field is not applicable."
         )
         try:
             raw = self._call_llm(provider, system, [{"role": "user", "content": question}], temperature=0).strip()
@@ -361,14 +341,12 @@ class VectorService:
             data              = json.loads(raw)
             patient_name_hint = (data.get("patient_name") or "").strip()
             search_intent     = (data.get("search_intent") or "").strip()
-            raw_sources       = data.get("sources") or []
-            sources = (
-                [s for s in raw_sources if s in self._VIEW_DESCRIPTIONS]
-                if isinstance(raw_sources, list) else []
-            )
-            return {"patient_name_hint": patient_name_hint, "search_intent": search_intent, "sources": sources}
+            record_type       = (data.get("record_type")   or "").strip().upper()
+            if record_type not in self._VALID_RECORD_TYPES:
+                record_type = ""
+            return {"patient_name_hint": patient_name_hint, "search_intent": search_intent, "record_type": record_type}
         except Exception:
-            return {"patient_name_hint": "", "search_intent": "", "sources": []}
+            return {"patient_name_hint": "", "search_intent": "", "record_type": ""}
 
     # ── Patient Resolution ────────────────────────────────────────────────────
 
@@ -384,42 +362,35 @@ class VectorService:
 
         # Strategy 1: keyword search on the patient_name field (most accurate).
         # Requires ALL name words to appear in the stored patient_name value.
-        # Runs across every per-view collection since the patient may only be
-        # resolvable from whichever view holds a match.
-        filter_must = [
-            FieldCondition(key="patient_name", match=MatchText(text=w))
-            for w in name_words
-        ]
-        for collection_name in self.view_collections:
-            try:
-                kw_hits, _ = self.client.scroll(
-                    collection_name=collection_name,
-                    scroll_filter=Filter(must=filter_must),
-                    limit=5,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-            except Exception:
-                continue
+        try:
+            filter_must = [
+                FieldCondition(key="patient_name", match=MatchText(text=w))
+                for w in name_words
+            ]
+            kw_hits, _ = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=Filter(must=filter_must),
+                limit=5,
+                with_payload=True,
+                with_vectors=False,
+            )
             for h in kw_hits:
                 pid       = str(h.payload.get("patient_id") or "").strip()
                 canonical = str(h.payload.get("patient_name") or "").strip()
                 if pid and pid.lower() not in ("none", ""):
                     return pid, canonical
+        except Exception:
+            pass
 
         # Strategy 2: semantic search fallback.
         # Requires at least 2 name words (or all if fewer than 2) to match.
-        query_vector = self._embed(name_hint)
-        min_match = min(2, len(name_words))
-        for collection_name in self.view_collections:
-            try:
-                sem_hits = self.client.query_points(
-                    collection_name=collection_name,
-                    query=query_vector,
-                    limit=10,
-                )
-            except Exception:
-                continue
+        try:
+            sem_hits = self.client.query_points(
+                collection_name=self.collection_name,
+                query=self._embed(name_hint),
+                limit=10,
+            )
+            min_match = min(2, len(name_words))
             for h in sem_hits.points:
                 pid       = str(h.payload.get("patient_id") or "").strip()
                 canonical = str(h.payload.get("patient_name") or "").strip()
@@ -428,6 +399,8 @@ class VectorService:
                 payload_text = (canonical + " " + h.payload.get("text", "")).lower()
                 if sum(1 for w in name_words if w in payload_text) >= min_match:
                     return pid, canonical
+        except Exception:
+            pass
 
         return "", ""
 
@@ -506,7 +479,6 @@ class VectorService:
         record_type: str = "",
         min_score: float = 0.60,
         keyword_rank_cutoff: int = None,
-        collection_names: list[str] = None,
     ) -> list[dict]:
         # Pick the best available filter strategy
         if patient_id:
@@ -519,11 +491,15 @@ class VectorService:
             hard_filter    = None
             patient_filter = None
 
-        target_collections = collection_names if collection_names is not None else [self.collection_name]
+        # Semantic search
+        vector_hits = self.client.query_points(
+            collection_name=self.collection_name,
+            query=self._embed(query),
+            query_filter=hard_filter,
+            limit=top_k,
+        )
 
-        query_vector = self._embed(query)
-
-        # Keyword search prep
+        # Keyword search
         kw_source = keyword_query if keyword_query is not None else query
         kw_tokens = [
             w for w in kw_source.lower().split()
@@ -532,68 +508,46 @@ class VectorService:
         hard_conds    = list(hard_filter.must)    if hard_filter    else []
         patient_conds = list(patient_filter.must) if patient_filter else []
 
-        cutoff = self._KEYWORD_RANK_CUTOFF if keyword_rank_cutoff is None else keyword_rank_cutoff
-
-        vector_scored: list[tuple] = []  # (id, score) pooled across collections
-        keyword_ids:   list        = []  # ids pooled across collections, storage order per collection
-        payload_by_id: dict        = {}
-
-        for collection_name in target_collections:
-            # Semantic search
-            try:
-                vector_hits = self.client.query_points(
-                    collection_name=collection_name,
-                    query=query_vector,
-                    query_filter=hard_filter,
+        keyword_hits: list = []
+        if hard_conds or kw_tokens:
+            all_conds = hard_conds + [
+                FieldCondition(key="text", match=MatchText(text=t)) for t in kw_tokens
+            ]
+            keyword_hits, _ = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=Filter(must=all_conds),
+                limit=top_k,
+                with_payload=True,
+                with_vectors=False,
+            )
+            # Fallback: patient filter only (no record_type, no kw_tokens)
+            if not keyword_hits and patient_conds:
+                keyword_hits, _ = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=Filter(must=patient_conds),
                     limit=top_k,
+                    with_payload=True,
+                    with_vectors=False,
                 )
-                for h in vector_hits.points:
-                    if h.score >= min_score:
-                        vector_scored.append((h.id, h.score))
-                        payload_by_id.setdefault(h.id, h.payload)
-            except Exception:
-                pass
 
-            # Keyword search
-            keyword_hits: list = []
-            if hard_conds or kw_tokens:
-                all_conds = hard_conds + [
-                    FieldCondition(key="text", match=MatchText(text=t)) for t in kw_tokens
-                ]
-                try:
-                    keyword_hits, _ = self.client.scroll(
-                        collection_name=collection_name,
-                        scroll_filter=Filter(must=all_conds),
-                        limit=top_k,
-                        with_payload=True,
-                        with_vectors=False,
-                    )
-                    # Fallback: patient filter only (no record_type, no kw_tokens)
-                    if not keyword_hits and patient_conds:
-                        keyword_hits, _ = self.client.scroll(
-                            collection_name=collection_name,
-                            scroll_filter=Filter(must=patient_conds),
-                            limit=top_k,
-                            with_payload=True,
-                            with_vectors=False,
-                        )
-                except Exception:
-                    keyword_hits = []
-
-            # scroll() returns filter matches in storage order, not ranked by relevance —
-            # so keep only the leading slice instead of trusting matches deep in the list.
-            for h in keyword_hits[:cutoff]:
-                keyword_ids.append(h.id)
-                payload_by_id.setdefault(h.id, h.payload)
-
-        # Sort the pooled semantic hits by score since collections were queried
-        # independently and their results aren't interleaved by relevance yet.
-        vector_scored.sort(key=lambda pair: pair[1], reverse=True)
-        vector_ids = [doc_id for doc_id, _ in vector_scored]
+        # scroll() returns filter matches in storage order, not ranked by relevance —
+        # so keep only the leading slice instead of trusting matches deep in the list.
+        cutoff       = self._KEYWORD_RANK_CUTOFF if keyword_rank_cutoff is None else keyword_rank_cutoff
+        keyword_hits = keyword_hits[:cutoff]
 
         # Rank fusion — combine the semantic and keyword rankings via RRF instead of
         # a plain union, so documents found by both signals outrank single-signal hits.
+        vector_ranked = [h for h in vector_hits.points if h.score >= min_score]
+        vector_ids    = [h.id for h in vector_ranked]
+        keyword_ids   = [h.id for h in keyword_hits]
+
         rrf_scores = self._rrf_fuse([vector_ids, keyword_ids])
+
+        payload_by_id = {}
+        for h in vector_ranked:
+            payload_by_id[h.id] = h.payload
+        for h in keyword_hits:
+            payload_by_id.setdefault(h.id, h.payload)
 
         ranked_ids = sorted(rrf_scores, key=lambda doc_id: rrf_scores[doc_id], reverse=True)
         results = [
@@ -931,14 +885,13 @@ class VectorService:
         db: Session = None,
         sql_provider: str = "openai",
     ) -> dict:
-        # print("asking")
         if session is None:
             session = {}
 
         # ── Step 1: Decompose query ───────────────────────────────────────────
         decomposed        = self._decompose_query(question, provider)
         search_intent     = decomposed["search_intent"]
-        sources           = decomposed["sources"]
+        record_type       = decomposed["record_type"]
         patient_name_hint = decomposed["patient_name_hint"]
 
         # ── Step 2: Resolve patient ───────────────────────────────────────────
@@ -1035,17 +988,10 @@ class VectorService:
         else:
             query_text = question
 
-        # Classify which collection(s) the question actually needs, based on the
-        # sources decomposed above — falls back to every collection when the
-        # question doesn't name a specific kind of record.
-        target_collections = (
-            [self._collection_for_source(s) for s in sources] if sources else self.view_collections
-        )
-
         print(f"[ASK] question={question!r}")
         print(f"[ASK] patient_id={patient_id!r}  patient_name={patient_name!r}  "
-              f"search_intent={search_intent!r}  sources={sources!r}  "
-              f"name_hint={patient_name_hint!r}  target_collections={target_collections!r}")
+              f"search_intent={search_intent!r}  record_type={record_type!r}  "
+              f"name_hint={patient_name_hint!r}")
 
         # ── Step 3: Search ────────────────────────────────────────────────────
         has_patient = bool(patient_id or patient_name)
@@ -1057,36 +1003,19 @@ class VectorService:
                 keyword_query=query_text,
                 patient_id=patient_id,
                 patient_name=patient_name,
+                record_type=record_type,
                 min_score=0.60,
-                collection_names=target_collections,
             )
         else:
             hits = self.search(
                 query_text,
                 top_k=10,
                 keyword_query=query_text,
+                record_type=record_type,
                 min_score=0.45,
-                collection_names=target_collections,
             )
 
         print(f"[ASK] hits={len(hits)}")
-
-        # If the classifier narrowed the search to specific collection(s) but found
-        # nothing there, widen to every collection before giving up — guards against
-        # a misclassified source hiding the real match in a different view.
-        if not hits and target_collections is not self.view_collections:
-            print("[ASK] no hits in classified collection(s), widening to all collections")
-            widen_kwargs = dict(
-                top_k=10, keyword_query=query_text,
-                collection_names=self.view_collections,
-            )
-            if has_patient:
-                hits = self.search(
-                    query_text, patient_id=patient_id, patient_name=patient_name,
-                    min_score=0.60, **widen_kwargs,
-                )
-            else:
-                hits = self.search(query_text, min_score=0.45, **widen_kwargs)
 
         # ── Step 4: Handle no hits ────────────────────────────────────────────
         if not hits:
