@@ -272,6 +272,7 @@ class VectorService:
 
         for source in self._SOURCES:
             collection_name = self._collection_for_source(source)
+            print(collection_name, since)
             # date_field = _SOURCE_DATE_FIELD.get(source, "")
             date_field = "created_timestamp"
             try:
@@ -895,6 +896,61 @@ class VectorService:
     def _is_existence_query(self, question: str) -> bool:
         return bool(self._EXISTENCE_PATTERN.search(question))
 
+    # Death/dying/prognosis-type questions — the system prompt already tells the LLM
+    # never to answer these with a direct Yes/No, but that instruction competes with
+    # the general "answer Yes/No first" rule and can get overridden. This pattern lets
+    # us enforce it deterministically in code as a backstop, regardless of phrasing.
+    _MORTALITY_PATTERN = re.compile(
+        r'\b(?:die|dies|died|dying|death|dead|deceased|mortality|prognosis)\b'
+        r'|\bsurviv\w*\b'
+        r'|\b(?:chance|chances|probability|likelihood|odds|risk)\s+(?:of|that|he|she|they)\b',
+        re.IGNORECASE,
+    )
+
+    _LEADING_YESNO = re.compile(r'^\s*(?:yes|no)\b[.,!:]?\s*', re.IGNORECASE)
+
+    # A literal death-status claim — if the model asserts one of these and the
+    # exact word never appears in the retrieved context, it's a hallucination,
+    # not a documented fact.
+    _DEATH_STATUS_WORDS = re.compile(
+        r'\b(?:deceased|died|passed away|expired)\b',
+        re.IGNORECASE,
+    )
+
+    # Predictive/alarmist commentary on outcome risk — the model editorializing
+    # about how dangerous a condition is, rather than reporting a documented fact.
+    _PROGNOSIS_COMMENTARY = re.compile(
+        r'\b(?:life-?threatening|can be fatal|could be fatal|risk of death|'
+        r'might not survive|could die|may die|likely to die|high mortality risk)\b',
+        re.IGNORECASE,
+    )
+
+    _NO_MORTALITY_INFO = (
+        "There is no documented prognosis or mortality information available for this patient."
+    )
+
+    # Deterministic backstop for the mortality/prognosis exception in the system
+    # prompt: for any death/dying/prognosis question — strip a leading Yes/No,
+    # block a death-status claim that isn't literally present in the retrieved
+    # context, and drop any sentence that editorializes about mortality risk
+    # instead of reporting a documented fact.
+    def _guard_mortality_answer(self, question: str, answer: str, context: str = "") -> str:
+        if not self._MORTALITY_PATTERN.search(question):
+            return answer
+
+        answer = self._LEADING_YESNO.sub("", answer).strip() or answer
+
+        if self._DEATH_STATUS_WORDS.search(answer) and not self._DEATH_STATUS_WORDS.search(context):
+            return (
+                "There is no documented record of the patient's death. I can only share what is "
+                "explicitly recorded, such as diagnosis, treatment, and admission/discharge status."
+            )
+
+        sentences = re.split(r'(?<=[.!?])\s+', answer)
+        kept = [s for s in sentences if not self._PROGNOSIS_COMMENTARY.search(s)]
+        cleaned = " ".join(kept).strip()
+        return cleaned or self._NO_MORTALITY_INFO
+
     # Strips a leading correction phrase ("i mean", "sorry", "actually", ...)
     # so a follow-up like "i mean balansi jemar" can be checked against a name.
     _CORRECTION_PREFIX = re.compile(
@@ -1225,6 +1281,7 @@ class VectorService:
 
         messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
         answer   = self._call_llm(provider, system_prompt, messages)
+        answer   = self._guard_mortality_answer(question, answer, context)
 
         return self._maybe_fallback({
             "question": question,
