@@ -1,9 +1,7 @@
 import re
 import json
-import time
 import uuid
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sa_text
 from qdrant_client import QdrantClient
@@ -357,7 +355,6 @@ class VectorService:
             '{"patient_name": "...", "search_intent": "...", "sources": [...]}\n'
             "Use null for patient_name/search_intent when not applicable."
         )
-        _t0 = time.perf_counter()
         try:
             raw = self._call_llm(provider, system, [{"role": "user", "content": question}], temperature=0).strip()
             raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
@@ -373,8 +370,6 @@ class VectorService:
             return {"patient_name_hint": patient_name_hint, "search_intent": search_intent, "sources": sources}
         except Exception:
             return {"patient_name_hint": "", "search_intent": "", "sources": []}
-        finally:
-            print(f"[TIMING] _decompose_query took {time.perf_counter() - _t0:.2f}s")
 
     # ── Patient Resolution ────────────────────────────────────────────────────
 
@@ -391,36 +386,23 @@ class VectorService:
         # Strategy 1: keyword search on the patient_name field (most accurate).
         # Requires ALL name words to appear in the stored patient_name value.
         # Runs across every per-view collection since the patient may only be
-        # resolvable from whichever view holds a match. Collections are queried
-        # concurrently (they're independent network round trips to Qdrant) but
-        # results are still checked in view_collections order so the "first
-        # matching collection wins" priority is unchanged from the sequential version.
+        # resolvable from whichever view holds a match.
         filter_must = [
             FieldCondition(key="patient_name", match=MatchText(text=w))
             for w in name_words
         ]
-
-        def _scroll_collection(collection_name: str) -> list:
+        for collection_name in self.view_collections:
             try:
-                hits, _ = self.client.scroll(
+                kw_hits, _ = self.client.scroll(
                     collection_name=collection_name,
                     scroll_filter=Filter(must=filter_must),
                     limit=5,
                     with_payload=True,
                     with_vectors=False,
                 )
-                return hits
             except Exception:
-                return []
-
-        with ThreadPoolExecutor(max_workers=min(8, len(self.view_collections))) as pool:
-            hits_by_collection = dict(zip(
-                self.view_collections,
-                pool.map(_scroll_collection, self.view_collections),
-            ))
-
-        for collection_name in self.view_collections:
-            for h in hits_by_collection.get(collection_name, []):
+                continue
+            for h in kw_hits:
                 pid       = str(h.payload.get("patient_id") or "").strip()
                 canonical = str(h.payload.get("patient_name") or "").strip()
                 if pid and pid.lower() not in ("none", ""):
@@ -430,25 +412,16 @@ class VectorService:
         # Requires at least 2 name words (or all if fewer than 2) to match.
         query_vector = self._embed(name_hint)
         min_match = min(2, len(name_words))
-
-        def _query_collection(collection_name: str):
+        for collection_name in self.view_collections:
             try:
-                return self.client.query_points(
+                sem_hits = self.client.query_points(
                     collection_name=collection_name,
                     query=query_vector,
                     limit=10,
-                ).points
+                )
             except Exception:
-                return []
-
-        with ThreadPoolExecutor(max_workers=min(8, len(self.view_collections))) as pool:
-            sem_hits_by_collection = dict(zip(
-                self.view_collections,
-                pool.map(_query_collection, self.view_collections),
-            ))
-
-        for collection_name in self.view_collections:
-            for h in sem_hits_by_collection.get(collection_name, []):
+                continue
+            for h in sem_hits.points:
                 pid       = str(h.payload.get("patient_id") or "").strip()
                 canonical = str(h.payload.get("patient_name") or "").strip()
                 if not pid or pid.lower() in ("none", ""):
@@ -566,12 +539,8 @@ class VectorService:
         keyword_ids:   list        = []  # ids pooled across collections, storage order per collection
         payload_by_id: dict        = {}
 
-        # Each collection's vector query + keyword scroll are independent Qdrant
-        # round trips, so run them concurrently across collections instead of one
-        # at a time — with up to 14 collections at 2 calls each, sequential search
-        # was the single biggest contributor to answer latency.
-        def _search_one(collection_name: str):
-            v_hits: list[tuple] = []
+        for collection_name in target_collections:
+            # Semantic search
             try:
                 vector_hits = self.client.query_points(
                     collection_name=collection_name,
@@ -581,10 +550,12 @@ class VectorService:
                 )
                 for h in vector_hits.points:
                     if h.score >= min_score:
-                        v_hits.append((h.id, h.score, h.payload))
+                        vector_scored.append((h.id, h.score))
+                        payload_by_id.setdefault(h.id, h.payload)
             except Exception:
                 pass
 
+            # Keyword search
             keyword_hits: list = []
             if hard_conds or kw_tokens:
                 all_conds = hard_conds + [
@@ -610,18 +581,9 @@ class VectorService:
                 except Exception:
                     keyword_hits = []
 
-            return v_hits, keyword_hits[:cutoff]
-
-        with ThreadPoolExecutor(max_workers=min(8, len(target_collections) or 1)) as pool:
-            per_collection_results = list(pool.map(_search_one, target_collections))
-
-        for v_hits, k_hits in per_collection_results:
-            for doc_id, score, payload in v_hits:
-                vector_scored.append((doc_id, score))
-                payload_by_id.setdefault(doc_id, payload)
             # scroll() returns filter matches in storage order, not ranked by relevance —
             # so keep only the leading slice instead of trusting matches deep in the list.
-            for h in k_hits:
+            for h in keyword_hits[:cutoff]:
                 keyword_ids.append(h.id)
                 payload_by_id.setdefault(h.id, h.payload)
 
@@ -1016,14 +978,7 @@ class VectorService:
     # Main RAG entry point: decomposes the question, resolves/tracks the active patient
     # across conversation turns, runs the hybrid search, builds context, and generates
     # a final answer via the LLM — falling back to text-to-SQL when context is insufficient.
-    def ask(self, question: str, *args, **kwargs) -> dict:
-        _t0 = time.perf_counter()
-        try:
-            return self._ask_inner(question, *args, **kwargs)
-        finally:
-            print(f"[TIMING] ask() total took {time.perf_counter() - _t0:.2f}s")
-
-    def _ask_inner(
+    def ask(
         self,
         question: str,
         provider: str = "ollama",
@@ -1043,7 +998,6 @@ class VectorService:
         patient_name_hint = decomposed["patient_name_hint"]
 
         # ── Step 2: Resolve patient ───────────────────────────────────────────
-        _t_resolve = time.perf_counter()
         patient_id   = session.get("patient_id", "")
         patient_name = session.get("patient_name", "")
 
@@ -1148,10 +1102,8 @@ class VectorService:
         print(f"[ASK] patient_id={patient_id!r}  patient_name={patient_name!r}  "
               f"search_intent={search_intent!r}  sources={sources!r}  "
               f"name_hint={patient_name_hint!r}  target_collections={target_collections!r}")
-        print(f"[TIMING] patient resolution took {time.perf_counter() - _t_resolve:.2f}s")
 
         # ── Step 3: Search ────────────────────────────────────────────────────
-        _t_search = time.perf_counter()
         has_patient = bool(patient_id or patient_name)
 
         if has_patient:
@@ -1174,7 +1126,6 @@ class VectorService:
             )
 
         print(f"[ASK] hits={len(hits)}")
-        print(f"[TIMING] search took {time.perf_counter() - _t_search:.2f}s")
 
         # If the classifier narrowed the search to specific collection(s) but found
         # nothing there, widen to every collection before giving up — guards against
@@ -1404,19 +1355,6 @@ class VectorService:
         messages: list[dict],
         temperature: float = 0.7,
     ) -> str:
-        _t0 = time.perf_counter()
-        try:
-            return self._call_llm_inner(provider, system_prompt, messages, temperature)
-        finally:
-            print(f"[TIMING] _call_llm({provider}) took {time.perf_counter() - _t0:.2f}s")
-
-    def _call_llm_inner(
-        self,
-        provider: str,
-        system_prompt: str,
-        messages: list[dict],
-        temperature: float = 0.7,
-    ) -> str:
         if provider == "openai":
             from openai import OpenAI
             r = OpenAI(api_key=settings.OPENAI_API_KEY).chat.completions.create(
@@ -1453,19 +1391,11 @@ class VectorService:
             return r.text.strip()
 
         elif provider == "ollama":
-            # num_ctx must stay constant across calls (Ollama only keeps a model
-            # "warm" in memory for a given (model, num_ctx) pair -- switching values
-            # forces a reload). It also must not be needlessly large: llama.cpp
-            # allocates the KV cache up front sized to num_ctx, so 25000 reserves
-            # enough memory to push the model off the GPU (or into swap) even for
-            # a one-line greeting, which is far more costly than any prompt content.
-            # _MAX_CTX_CHARS already caps retrieved context well under what this fits.
             res = self.embed_client.chat(
                 model=settings.OLLAMA_LLM_MODEL,
                 messages=[{"role": "system", "content": system_prompt}] + messages,
-                options={"num_ctx": settings.OLLAMA_NUM_CTX, "temperature": temperature},
+                options={"num_ctx": 25000, "temperature": temperature},
             )
             return res.message.content.strip()
 
         raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
-

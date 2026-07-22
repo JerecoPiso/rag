@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     OLLAMA_API_KEY:              str = ""
     OLLAMA_EMBED_MODEL:          str = "nomic-embed-text"
     OLLAMA_LLM_MODEL:            str = "llama3.2"
+    OLLAMA_NUM_CTX:              int = 8192
 
     class Config:
         env_file = ".env"

@@ -1,5 +1,6 @@
 import re
 import json
+import time
 from sqlalchemy import text, inspect
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
@@ -29,6 +30,13 @@ class RAGService:
             raise HTTPException(status_code=400, detail=f"Unknown provider: {self.provider}")
 
     def _call_llm(self, prompt: str) -> str:
+        _t0 = time.perf_counter()
+        try:
+            return self._call_llm_inner(prompt)
+        finally:
+            print(f"[TIMING] RAGService._call_llm({self.provider}) took {time.perf_counter() - _t0:.2f}s")
+
+    def _call_llm_inner(self, prompt: str) -> str:
         if self.provider == "openai":
             response = self.client.chat.completions.create(
                 model="gpt-4o",
@@ -56,7 +64,7 @@ class RAGService:
             response = self.client.chat(
                 model=settings.OLLAMA_LLM_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                options={"num_ctx": 25000 },
+                options={"num_ctx": settings.OLLAMA_NUM_CTX},
             )
             return response.message.content.strip()
 
@@ -398,7 +406,14 @@ class RAGService:
         words = set(re.findall(r"[a-z']+", question.lower()))
         return bool(words & self._GREETING_WORDS) and len(question.split()) <= 6
 
-    def ask(self, question: str, history: list[dict] | None = None, session: dict | None = None) -> dict:
+    def ask(self, question: str, *args, **kwargs) -> dict:
+        _t0 = time.perf_counter()
+        try:
+            return self._ask_inner(question, *args, **kwargs)
+        finally:
+            print(f"[TIMING] RAGService.ask() total took {time.perf_counter() - _t0:.2f}s")
+
+    def _ask_inner(self, question: str, history: list[dict] | None = None, session: dict | None = None) -> dict:
         if self._is_greeting(question):
             answer = self._call_llm(
                 "You are a helpful medical assistant for a hospital system. "

@@ -1,5 +1,6 @@
 import base64
 import re
+import time
 import uuid as _uuid
 from fastapi import Depends
 from sqlalchemy.orm import Session
@@ -67,6 +68,7 @@ class RAGController:
 
     @staticmethod
     def ask_vector(data: VectorRAGRequest, db: Session = Depends(get_db)):
+        _t_req = time.perf_counter()
         conv_id = data.conversation_id or str(_uuid.uuid4())
         if conv_id not in _sessions:
             _sessions[conv_id] = {}
@@ -95,7 +97,8 @@ class RAGController:
 
         audio = None
 
-
+        print(f"[TIMING] ask_vector answer took {time.perf_counter() - _t_req:.2f}s")
+        _t_tts = time.perf_counter()
         if result.get("answer"):
             try:
                 audio_bytes, media_type = SpeechService().synthesize(result["answer"])
@@ -103,6 +106,8 @@ class RAGController:
                 audio = f"data:{media_type};base64,{encoded}"
             except Exception:
                 pass  # Text answer still stands even if speech synthesis fails.
+        print(f"[TIMING] TTS synthesis took {time.perf_counter() - _t_tts:.2f}s")
+        print(f"[TIMING] ask_vector total request took {time.perf_counter() - _t_req:.2f}s")
 
         return {**result, "source": result.get("source", "vector"), "conversation_id": conv_id, "audio": audio}
 
