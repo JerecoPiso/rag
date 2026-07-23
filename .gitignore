@@ -16,6 +16,8 @@ env/
 ENV/
 app/__pycache__
 app/__pycache__/
+app/assets/
+
 # Environment variables
 .env
 .env.*
