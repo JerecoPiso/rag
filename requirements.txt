@@ -14,3 +14,4 @@ qdrant-client
 ollama
 faster-whisper
 python-multipart
+piper-tts

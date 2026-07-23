@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     OLLAMA_EMBED_MODEL:          str = "nomic-embed-text"
     OLLAMA_LLM_MODEL:            str = "llama3.2"
     OLLAMA_NUM_CTX:              int = 8192
+    PIPER_VOICE_MODEL:           str = "app/assets/voices/en_US-lessac-medium.onnx"
 
     class Config:
         env_file = ".env"

@@ -310,52 +310,74 @@ class VectorService:
 
     # ── Query Decomposition ───────────────────────────────────────────────────
 
-    # Deterministic keyword → collection map used to narrow the search when a
-    # question clearly names a specific kind of record. Deliberately excludes
-    # generic words (e.g. "record", "info", "history" — already in _STOPWORDS and
-    # so never reach this check) since those mean "search everything", not one view.
-    _SOURCE_KEYWORDS: dict[str, frozenset[str]] = {
-        "_patient_case_vital_vw":               frozenset({"assessment", "examination", "exam", "physical"}),
-        "_patient_case_nurses_note_vw":         frozenset({"nurse", "nurses", "nursing", "nurse's notes", "nursing notes", "nursing note"}),
-        "_patient_case_doctors_note_vw":        frozenset({"doctor", "doctors", "physician", "order", "orders"}),
-        "_patient_case_diet_vw":                frozenset({"diet", "food", "meal", "meals", "nutrition"}),
-        "_patient_case_medicine_vw":            frozenset({"medicine", "medicines", "medication", "medications", "prescription", "prescriptions", "drug", "drugs"}),
-        "_patient_case_medical_consumption_vw": frozenset({"consumption", "supply", "supplies", "ivf", "oxygen", "consumed"}),
-        "_patient_case_status_vw":              frozenset({"diagnosis", "diagnoses", "admission", "admitted", "discharge", "discharged", "classification", "complaint", "status"}),
-        "_patient_tpr_vw":                      frozenset({"tpr", "temperature", "pulse", "respiration", "vitals", "vital sign", "vital signs"}),
-        "_patient_opr_vw":                      frozenset({"opr", "outpatient"}),
-        "_patient_monitor_vw":                  frozenset({"monitor", "monitoring", "monitoring vital", "monitoring vitals", "monitoring vital signs", "monitoring vital sign"}),
-        "_patient_fluid_intake_and_output_vw":  frozenset({"fluid", "fiao", "intake", "output"}),
-        "_patient_diagnostics_vw":              frozenset({"lab", "labs", "laboratory", "diagnostics", "diagnostic", "test", "tests", "result", "results"}),
-        "_patient_info":                        frozenset({"demographic", "demographics", "birthdate", "birthday", "address", "name", "contact", "phone", "email", "gender", "age", "patient info", "patient information"}),
-        "_patient_case_summary":                frozenset({"summary", "overview"}),
+    # What each view represents — grounds the LLM's routing decision in what's
+    # actually in each collection, instead of forcing the question into a fixed
+    # category enum that has to be kept in sync with the collections by hand.
+    _VIEW_DESCRIPTIONS: dict[str, str] = {
+        "_patient_case_vital_vw":               "Clinical assessment / physical examination recorded for a patient case.",
+        "_patient_case_nurses_note_vw":         "Nurses' notes for a patient case.",
+        "_patient_case_doctors_note_vw":        "Doctors' notes/orders for a patient case.",
+        "_patient_case_diet_vw":                "Diet orders for a patient case.",
+        "_patient_case_medicine_vw":            "Medicines/prescriptions ordered for a patient case.",
+        "_patient_case_medical_consumption_vw": "Medical supplies/items consumed for a patient case (e.g. IVF, oxygen).",
+        "_patient_case_status_vw":              "Admission/discharge/case status: patient_status (INP/OPD/ER), discharge_date, discharge_type, case_classification, patient_type. And the patient's case (diagnosis, chief complaint, etc.).",
+        "_patient_tpr_vw":                      "Ward vital signs (temperature/pulse/respiration chart) for admitted patients.",
+        "_patient_opr_vw":                      "Out-patient vital signs recorded during an OPD visit.",
+        "_patient_monitor_vw":                  "Continuous monitoring vital signs.",
+        "_patient_fluid_intake_and_output_vw":  "Fluid intake and output (FIAO) tracking.",
+        "_patient_diagnostics_vw":              "Diagnostics/laboratory test results.",
+        "_patient_info":                        "General patient demographic/basic info (name, id, birthdate, address, etc.).",
+        "_patient_case_summary":                "Hospital-wide patient counts (OPD/ER/inpatient active/discharged) — not specific to any one patient.",
     }
 
-    # Heuristic replacement for what used to be an LLM call: pulls the patient name
-    # out via the same regex used for name resolution (_extract_name), strips
-    # filler/name words from what's left (_STOPWORDS) to get the search intent, then
-    # checks the remaining words against _SOURCE_KEYWORDS to optionally narrow which
-    # collection(s) to search — all with no network/LLM round trip. Falls back to
-    # every collection (sources=[]) when nothing in the question matches a keyword,
-    # same as search() already does for an empty/unclassified source list.
-    def _decompose_query(self, question: str) -> dict:
+    # Uses an LLM to break a natural-language question into structured parts:
+    # patient name, core medical search intent, and which view(s) (if any) the
+    # question specifically targets.
+    def _decompose_query(self, question: str, provider: str) -> dict:
+      
+        catalog = "\n".join(f"- {source}: {desc}" for source, desc in self._VIEW_DESCRIPTIONS.items())
+        system = (
+            "You are a query analyzer for a hospital EMR system.\n"
+            "Given a question, extract:\n"
+            "- patient_name: the full name of the patient mentioned IN THIS QUESTION ONLY "
+            "(first, middle, and last name if present). "
+            "Return null if no patient name is explicitly in the question text.\n"
+            "- search_intent: the core MEDICAL condition, symptom, or topic — "
+            "remove filler words AND remove patient names. "
+            "Generic phrases like 'medical record', 'patient chart', 'medical history', "
+            "'all records', 'information' mean the user wants everything — return null.\n"
+            "- sources: ONLY set when the question explicitly asks for a specific kind of record. "
+            "Given this list of record collections and what each one contains:\n\n"
+            f"{catalog}\n\n"
+            "Return a JSON array of the exact collection name(s), character-for-character as listed "
+            "above, that should be searched to answer the question. Most questions target exactly "
+            "one collection; only include more than one if the question genuinely spans several "
+            "kinds of records. Generic phrases like 'medical record', 'patient chart', 'history', "
+            "or a bare patient name mean the user wants everything — return an empty array [].\n\n"
+            "Respond in JSON only:\n"
+            '{"patient_name": "...", "search_intent": "...", "sources": [...]}\n'
+            "Use null for patient_name/search_intent when not applicable."
+        )
         _t0 = time.perf_counter()
-        name = self._extract_name(question)
-        remainder = re.sub(re.escape(name), "", question, flags=re.IGNORECASE) if name else question
-        intent_words = [
-            w for w in re.findall(r"[A-Za-z']+", remainder.lower())
-            if len(w) >= 3 and w not in self._STOPWORDS
-        ]
-        search_intent = " ".join(intent_words)
-
-        word_set = set(intent_words)
-        sources = [
-            source for source, keywords in self._SOURCE_KEYWORDS.items()
-            if word_set & keywords
-        ]
-
-        print(f"[TIMING] _decompose_query took {time.perf_counter() - _t0:.4f}s")
-        return {"patient_name_hint": name, "search_intent": search_intent, "sources": sources}
+        try:
+            raw = self._call_llm(provider, system, [{"role": "user", "content": question}], temperature=0).strip()
+         
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw)
+            data              = json.loads(raw)
+            patient_name_hint = (data.get("patient_name") or "").strip()
+            search_intent     = (data.get("search_intent") or "").strip()
+            raw_sources       = data.get("sources") or []
+            sources = (
+                [s for s in raw_sources if s in self._VIEW_DESCRIPTIONS]
+                if isinstance(raw_sources, list) else []
+            )
+            print(f"[TIMING] _decompose_query took {time.perf_counter() - _t0:.2f}s")
+            return {"patient_name_hint": patient_name_hint, "search_intent": search_intent, "sources": sources}
+        except Exception:
+            return {"patient_name_hint": "", "search_intent": "", "sources": []}
+        finally:
+            print(f"[TIMING] _decompose_query took {time.perf_counter() - _t0:.2f}s")
 
     # ── Patient Resolution ────────────────────────────────────────────────────
 
@@ -1021,7 +1043,7 @@ class VectorService:
 
         # ── Step 1: Decompose query ───────────────────────────────────────────
         # print("_decompose_query")
-        decomposed        = self._decompose_query(question)
+        decomposed        = self._decompose_query(question, provider)
         search_intent     = decomposed["search_intent"]
         sources           = decomposed["sources"]
         patient_name_hint = decomposed["patient_name_hint"]

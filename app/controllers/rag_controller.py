@@ -46,7 +46,9 @@ class RAGController:
         audio = None
         if result.get("answer"):
             try:
-                audio_bytes, media_type = SpeechService().synthesize(result["answer"])
+                audio_bytes, media_type = SpeechService().synthesize(
+                    result["answer"], provider=data.tts_provider
+                )
                 encoded = base64.b64encode(audio_bytes).decode("ascii")
                 audio = f"data:{media_type};base64,{encoded}"
             except Exception:
@@ -101,7 +103,9 @@ class RAGController:
         _t_tts = time.perf_counter()
         if result.get("answer"):
             try:
-                audio_bytes, media_type = SpeechService().synthesize(result["answer"])
+                audio_bytes, media_type = SpeechService().synthesize(
+                    result["answer"], provider=data.tts_provider
+                )
                 encoded = base64.b64encode(audio_bytes).decode("ascii")
                 audio = f"data:{media_type};base64,{encoded}"
             except Exception:
