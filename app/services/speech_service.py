@@ -1,4 +1,5 @@
 import io
+import re
 import wave
 from fastapi import HTTPException
 from openai import OpenAI
@@ -23,6 +24,34 @@ def _get_piper_voice() -> PiperVoice:
     if _piper_voice is None:
         _piper_voice = PiperVoice.load(settings.PIPER_VOICE_MODEL)
     return _piper_voice
+
+
+# Strips markdown syntax down to plain spoken text — otherwise TTS engines read
+# out literal symbols ("asterisk asterisk", "pound", "pipe") instead of the words.
+def _strip_markdown(text: str) -> str:
+    # Literal escape sequences (backslash + letter, as opposed to an actual newline
+    # char) show up when text passed through a JSON round trip without decoding —
+    # normalize them to real whitespace before anything else, or the markdown
+    # regexes below (which anchor on real \n) won't see line boundaries, and the
+    # TTS engine ends up reading "backslash n" out loud.
+    text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", " ").replace("\\r", "\n")
+    text = re.sub(r"```[a-zA-Z0-9]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)   # fenced code blocks
+    text = re.sub(r"`([^`]+)`", r"\1", text)                                     # inline code
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)                        # images
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)                         # links
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)                   # headers
+    text = re.sub(r"(\*\*\*|___)(.+?)\1", r"\2", text)                           # bold+italic
+    text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text)                              # bold
+    text = re.sub(r"(?<!\w)(\*|_)(.+?)\1(?!\w)", r"\2", text)                    # italic
+    text = re.sub(r"~~(.+?)~~", r"\1", text)                                     # strikethrough
+    text = re.sub(r"^>\s?", "", text, flags=re.MULTILINE)                        # blockquotes
+    text = re.sub(r"^[ \t]*[-*+]\s+", "", text, flags=re.MULTILINE)              # bullet list markers
+    text = re.sub(r"^\s*([-*_])\1{2,}\s*$", "", text, flags=re.MULTILINE)        # horizontal rules
+    text = re.sub(r"^\s*\|?[-:| ]+\|[-:| ]*\s*$", "", text, flags=re.MULTILINE)  # table separator rows
+    text = text.replace("|", " ")                                                # remaining table pipes
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
 
 
 _VALID_PROVIDERS = {"openai", "piper"}
@@ -50,6 +79,8 @@ class SpeechService:
     ) -> tuple[bytes, str]:
         if provider not in _VALID_PROVIDERS:
             raise HTTPException(status_code=400, detail=f"Unsupported TTS provider: {provider}")
+
+        text = _strip_markdown(text)
 
         if provider == "piper":
             return self._synthesize_piper(text)
