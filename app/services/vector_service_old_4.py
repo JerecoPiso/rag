@@ -617,12 +617,7 @@ class VectorService:
         # a plain union, so documents found by both signals outrank single-signal hits.
         rrf_scores = self._rrf_fuse([vector_ids, keyword_ids])
 
-        # Fusion runs across every searched collection, so the merged candidate
-        # pool can far exceed top_k (e.g. 46 hits from 14 collections) even
-        # though each collection was only asked for top_k. Cap the final list
-        # here so only the best-ranked hits are ever built into LLM context —
-        # sending every fused hit was the dominant cost on multi-collection asks.
-        ranked_ids = sorted(rrf_scores, key=lambda doc_id: rrf_scores[doc_id], reverse=True)[:top_k]
+        ranked_ids = sorted(rrf_scores, key=lambda doc_id: rrf_scores[doc_id], reverse=True)
         results = [
             {
                 "score": rrf_scores[doc_id],

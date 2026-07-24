@@ -67,8 +67,10 @@ class TranscriptionService:
         model_size: str = "base",
     ) -> dict:
         if provider == "faster-whisper":
+            print(f"Transcribing with faster-whisper model size: {model_size}")
             result = _transcribe_faster_whisper(audio_bytes, filename, model_size)
         else:
+            
             result = _transcribe_openai(audio_bytes, filename)
 
         result["audio"] = None
