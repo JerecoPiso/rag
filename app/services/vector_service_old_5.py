@@ -1154,33 +1154,6 @@ class VectorService:
                 collection_names=target_collections,
             )
         else:
-            # No patient resolved at all — the question isn't about one named
-            # person, it's a criteria/attribute question spanning multiple
-            # patients (e.g. "patients with pneumonia", "patients in station 3"),
-            # even though neither says "list". Detecting this doesn't depend on
-            # matching that exact wording — failing to resolve a patient IS the
-            # signal — so try text-to-SQL first, where a real WHERE-clause filter
-            # answers "which/how many patients match X" far more reliably than
-            # vector similarity search over patient-record chunks ever could.
-            # Greetings/small talk are excluded first so they don't get routed
-            # into a SQL query attempt.
-            question_words = set(question.lower().split())
-            if question_words & self._GREETING_WORDS and len(question.split()) <= 6:
-                system_prompt = (
-                    "You are a helpful medical assistant for a hospital system. "
-                    "Respond naturally to greetings and small talk. "
-                    "Do not discuss topics outside the medical domain."
-                )
-                messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
-                answer   = self._call_llm(provider, system_prompt, messages)
-                return {"question": question, "context": [], "answer": answer, "context_sufficient": True}
-
-            if db is not None:
-                sql_result = self._fallback_to_sql(question, history, db, sql_provider, session)
-                if sql_result is not None and sql_result.get("context_sufficient"):
-                    print("[ASK] answered via SQL (no specific patient resolved)")
-                    return sql_result
-
             hits = self.search(
                 query_text,
                 top_k=10,
@@ -1223,15 +1196,23 @@ class VectorService:
                     "context_sufficient": False,
                 }, question, history, db, sql_provider, session)
 
-            # Greeting check and the SQL attempt already happened above (Step 3)
-            # for the no-patient path, so there's nothing left to retry here —
-            # calling _fallback_to_sql again would just repeat the same failed query.
-            return {
+            question_words = set(question.lower().split())
+            if question_words & self._GREETING_WORDS and len(question.split()) <= 6:
+                system_prompt = (
+                    "You are a helpful medical assistant for a hospital system. "
+                    "Respond naturally to greetings and small talk. "
+                    "Do not discuss topics outside the medical domain."
+                )
+                messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
+                answer   = self._call_llm(provider, system_prompt, messages)
+                return {"question": question, "context": [], "answer": answer, "context_sufficient": True}
+
+            return self._maybe_fallback({
                 "question": question,
                 "context":  [],
                 "answer":   "No matching patient records found. Try specifying a patient name.",
                 "context_sufficient": False,
-            }
+            }, question, history, db, sql_provider, session)
 
         # ── Step 5: Generate answer ───────────────────────────────────────────
         # Sort most-recent-first so the LLM sees the latest records at the top.
