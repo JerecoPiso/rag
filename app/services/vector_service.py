@@ -933,7 +933,8 @@ class VectorService:
         re.IGNORECASE,
     )
 
-    _LEADING_YESNO = re.compile(r'^\s*(?:yes|no)\b[.,!:]?\s*', re.IGNORECASE)
+    # _LEADING_YESNO = re.compile(r'^\s*(?:yes|no)\b[.,!:]?\s*', re.IGNORECASE)
+    _LEADING_YESNO = re.compile(r'^\s*yes\b[.,!:]?\s*', re.IGNORECASE)
 
     # A literal death-status claim — if the model asserts one of these and the
     # exact word never appears in the retrieved context, it's a hallucination,
