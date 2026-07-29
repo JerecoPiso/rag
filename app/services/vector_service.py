@@ -1054,6 +1054,7 @@ class VectorService:
         # active in session. Only short-circuits when the message is NOTHING
         # but greeting/filler words; any attached question still runs normally.
         if self._is_pure_greeting(question):
+            _t_greeting = time.perf_counter()
             system_prompt = (
                 "You are a helpful medical assistant for a hospital system. "
                 "Respond naturally to greetings and small talk. "
@@ -1061,6 +1062,7 @@ class VectorService:
             )
             messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
             answer   = self._call_llm(provider, system_prompt, messages)
+            print(f"[TIMING] greeting took {time.perf_counter() - _t_greeting:.2f}s")
             return {"question": question, "context": [], "answer": answer, "context_sufficient": True}
 
         # ── Step 1: Decompose query ───────────────────────────────────────────
