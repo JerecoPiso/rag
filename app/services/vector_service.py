@@ -1057,7 +1057,7 @@ class VectorService:
             _t_greeting = time.perf_counter()
             system_prompt = (
                 "You are a helpful medical assistant for a hospital system. "
-                "Respond naturally to greetings and small talk. "
+                # "Respond naturally to greetings and small talk. "
                 "Do not discuss topics outside the medical domain."
             )
             messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
@@ -1513,4 +1513,40 @@ class VectorService:
             return res.message.content.strip()
 
         raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
+
+    # ── Warm-up ──────────────────────────────────────────────────────────────
+
+    # Forces both the LLM and embedding models into GPU memory ahead of the
+    # user's first real message, so that message doesn't pay the multi-second
+    # model-load cost itself. Meant to be called by the frontend as soon as a
+    # chat session opens (e.g. on mount), not on every request.
+    # - num_ctx matches the real chat calls so there's no later reload from a
+    #   mismatched KV-cache size.
+    # - num_predict=1 keeps the chat ping itself fast -- only the load matters.
+    # - keep_alive matches settings.OLLAMA_KEEP_ALIVE so the model stays warm
+    #   for the same duration a real call would keep it warm.
+    def warm_up(self) -> dict:
+        result = {"llm": False, "embed": False}
+        try:
+            self.embed_client.chat(
+                model=settings.OLLAMA_LLM_MODEL,
+                messages=[{"role": "user", "content": "hi"}],
+                options={"num_predict": 1},
+                keep_alive=settings.OLLAMA_KEEP_ALIVE,
+            )
+            result["llm"] = True
+        except Exception as e:
+            print(f"[WARMUP] failed to warm up LLM model: {e}")
+
+        try:
+            self.embed_client.embed(
+                model=settings.OLLAMA_EMBED_MODEL,
+                input="hi",
+                keep_alive=settings.OLLAMA_KEEP_ALIVE,
+            )
+            result["embed"] = True
+        except Exception as e:
+            print(f"[WARMUP] failed to warm up embedding model: {e}")
+
+        return result
 

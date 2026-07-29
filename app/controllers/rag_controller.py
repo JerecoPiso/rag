@@ -73,6 +73,11 @@ class RAGController:
         return {**result, "audio": audio}
 
     @staticmethod
+    def warm_up():
+        svc = _get_vector_service("patient_info")
+        return svc.warm_up()
+
+    @staticmethod
     def ingest(data: IngestRequest):
         svc = _get_vector_service(data.collection)
         count = svc.ingest(data.texts, data.metadatas)

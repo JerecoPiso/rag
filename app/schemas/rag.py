@@ -15,6 +15,10 @@ class RAGResponse(BaseModel):
 
 # --- Qdrant vector schemas ---
 
+class WarmUpResponse(BaseModel):
+    llm:   bool
+    embed: bool
+
 class IngestRequest(BaseModel):
     texts:      list[str]
     metadatas:  list[dict[str, Any]] = []
