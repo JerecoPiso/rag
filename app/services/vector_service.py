@@ -64,14 +64,14 @@ class VectorService:
         self.view_collections = [self._collection_for_source(s) for s in self._SOURCES]
         try:
             self.client = QdrantClient(url=settings.QDRANT_URL)
-            self.client.get_collections()
+            existing = {c.name for c in self.client.get_collections().collections}
         except Exception as e:
             raise HTTPException(
                 status_code=503,
                 detail=f"Cannot connect to Qdrant at {settings.QDRANT_URL}. ({e})"
             )
         try:
-            self._ensure_all_collections()
+            self._ensure_all_collections(existing)
         except Exception as e:
             msg = str(e)
             if "ollama" in msg.lower() or settings.OLLAMA_URL in msg:
@@ -131,8 +131,9 @@ class VectorService:
                 pass
 
     # Ensures the generic default collection plus every per-view collection exist.
-    def _ensure_all_collections(self):
-        existing = {c.name for c in self.client.get_collections().collections}
+    # `existing` is reused from the connectivity check in __init__ so this doesn't
+    # make a second get_collections() round trip to Qdrant.
+    def _ensure_all_collections(self, existing: set[str]):
         names = list(dict.fromkeys([self.collection_name, *self.view_collections]))
         for name in names:
             if name not in existing:
@@ -997,10 +998,32 @@ class VectorService:
 
     # ── Ask ───────────────────────────────────────────────────────────────────
 
+    # Trigger words that make a message greeting/small-talk-shaped.
     _GREETING_WORDS = frozenset({
-        "hello", "hi", "hey", "thanks", "thank", "good",
-        "bye", "goodbye", "morning", "afternoon", "evening",
+        "hi", "hii", "hiya", "hello", "hey", "heya", "yo", "sup",
+        "greetings", "howdy", "thanks", "thank", "good",
+        "bye", "goodbye", "morning", "afternoon", "evening", "night", "day",
     })
+
+    # Filler words allowed alongside a greeting trigger without turning the
+    # message into a real question (e.g. "hi how are you", "thanks so much").
+    _GREETING_FILLER_WORDS = frozenset({
+        "there", "again", "how", "are", "you", "doing", "much", "so", "very",
+        "ok", "okay",
+    })
+
+    # True only when the ENTIRE message is greeting/small-talk — every word is
+    # either a greeting trigger or allowed filler, and at least one greeting
+    # trigger is present. A message like "hi, does she have diabetes" has real
+    # question words ("does", "she", "have", "diabetes") and correctly returns
+    # False so it still goes through normal search.
+    def _is_pure_greeting(self, question: str) -> bool:
+        words = re.findall(r"[A-Za-z']+", question.lower())
+        if not words:
+            return False
+        if not any(w in self._GREETING_WORDS for w in words):
+            return False
+        return all(w in self._GREETING_WORDS or w in self._GREETING_FILLER_WORDS for w in words)
 
     # Main RAG entry point: decomposes the question, resolves/tracks the active patient
     # across conversation turns, runs the hybrid search, builds context, and generates
@@ -1024,6 +1047,21 @@ class VectorService:
         # print("asking")
         if session is None:
             session = {}
+
+        # ── Step 0: Pure greeting / small talk ────────────────────────────────
+        # Checked before patient resolution/search so a bare "hi" always goes
+        # straight to the LLM — even mid-conversation with a patient already
+        # active in session. Only short-circuits when the message is NOTHING
+        # but greeting/filler words; any attached question still runs normally.
+        if self._is_pure_greeting(question):
+            system_prompt = (
+                "You are a helpful medical assistant for a hospital system. "
+                "Respond naturally to greetings and small talk. "
+                "Do not discuss topics outside the medical domain."
+            )
+            messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
+            answer   = self._call_llm(provider, system_prompt, messages)
+            return {"question": question, "context": [], "answer": answer, "context_sufficient": True}
 
         # ── Step 1: Decompose query ───────────────────────────────────────────
         # print("_decompose_query")
@@ -1163,19 +1201,7 @@ class VectorService:
             # signal — so try text-to-SQL first, where a real WHERE-clause filter
             # answers "which/how many patients match X" far more reliably than
             # vector similarity search over patient-record chunks ever could.
-            # Greetings/small talk are excluded first so they don't get routed
-            # into a SQL query attempt.
-            question_words = set(question.lower().split())
-            if question_words & self._GREETING_WORDS and len(question.split()) <= 6:
-                system_prompt = (
-                    "You are a helpful medical assistant for a hospital system. "
-                    "Respond naturally to greetings and small talk. "
-                    "Do not discuss topics outside the medical domain."
-                )
-                messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
-                answer   = self._call_llm(provider, system_prompt, messages)
-                return {"question": question, "context": [], "answer": answer, "context_sufficient": True}
-
+            # Pure greetings/small talk are already handled in Step 0 above.
             if db is not None:
                 sql_result = self._fallback_to_sql(question, history, db, sql_provider, session)
                 if sql_result is not None and sql_result.get("context_sufficient"):
@@ -1465,14 +1491,22 @@ class VectorService:
             # num_ctx must stay constant across calls (Ollama only keeps a model
             # "warm" in memory for a given (model, num_ctx) pair -- switching values
             # forces a reload). It also must not be needlessly large: llama.cpp
-            # allocates the KV cache up front sized to num_ctx, so 25000 reserves
-            # enough memory to push the model off the GPU (or into swap) even for
-            # a one-line greeting, which is far more costly than any prompt content.
-            # _MAX_CTX_CHARS already caps retrieved context well under what this fits.
+            # allocates the KV cache up front sized to num_ctx, so a large value
+            # reserves enough memory to push the model off the GPU (or into swap)
+            # even for a one-line greeting, which is far more costly than any
+            # prompt content. _MAX_CTX_CHARS already caps retrieved context well
+            # under what this fits.
+            #
+            # keep_alive: Ollama's default is 5 minutes, after which the model is
+            # evicted from GPU memory and the next call pays a full reload (measured
+            # ~8s for llama3.2:3b) -- easily triggered by normal pauses between chat
+            # turns, not just idle periods. Explicitly extend it so the model stays
+            # resident across realistic gaps between messages.
             res = self.embed_client.chat(
                 model=settings.OLLAMA_LLM_MODEL,
                 messages=[{"role": "system", "content": system_prompt}] + messages,
                 options={"num_ctx": settings.OLLAMA_NUM_CTX, "temperature": temperature},
+                keep_alive=settings.OLLAMA_KEEP_ALIVE,
             )
             return res.message.content.strip()
 

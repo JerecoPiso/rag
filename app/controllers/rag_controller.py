@@ -15,6 +15,22 @@ from app.schemas.rag import RAGRequest, IngestRequest, SearchRequest, VectorRAGR
 # In-memory session store: conversation_id → {"active_patient": "..."}
 _sessions: dict[str, dict] = {}
 
+
+# VectorService.__init__ connects to Qdrant and checks that every collection
+# exists (~1.7s per call, measured), so constructing a fresh instance on every
+# request was the dominant cost even for a plain "hi". Collections don't
+# change between requests, so one instance per collection_name is reused for
+# the life of the process instead.
+_vector_services: dict[str, VectorService] = {}
+
+
+def _get_vector_service(collection_name: str) -> VectorService:
+    svc = _vector_services.get(collection_name)
+    if svc is None:
+        svc = VectorService(collection_name=collection_name)
+        _vector_services[collection_name] = svc
+    return svc
+
 # Questions asking for a count/total of admitted, outpatient, ER, or discharged
 # patients are answered more reliably by RAGService's text-to-SQL path (which
 # knows about patient_status / discharge_type) than by the vector search path.
@@ -58,13 +74,13 @@ class RAGController:
 
     @staticmethod
     def ingest(data: IngestRequest):
-        svc = VectorService(collection_name=data.collection)
+        svc = _get_vector_service(data.collection)
         count = svc.ingest(data.texts, data.metadatas)
         return {"ingested": count, "collection": data.collection}
 
     @staticmethod
     def search(data: SearchRequest):
-        svc = VectorService(collection_name=data.collection)
+        svc = _get_vector_service(data.collection)
         results = svc.search(data.query, top_k=data.top_k)
         return {"query": data.query, "results": results}
 
@@ -87,7 +103,7 @@ class RAGController:
                 "source":   "sql",
             }
         else:
-            svc    = VectorService(collection_name=data.collection)
+            svc    = _get_vector_service(data.collection)
             result = svc.ask(
                 data.question,
                 provider=data.provider,
@@ -117,10 +133,10 @@ class RAGController:
 
     @staticmethod
     def sync(data: SyncRequest, db: Session = Depends(get_db)):
-        svc = VectorService(collection_name=data.collection)
+        svc = _get_vector_service(data.collection)
         return svc.sync_from_db(db, clear=data.clear)
 
     @staticmethod
     def sync_latest(data: SyncLatestRequest, db: Session = Depends(get_db)):
-        svc = VectorService(collection_name=data.collection)
+        svc = _get_vector_service(data.collection)
         return svc.sync_latest(db, since=data.since)
