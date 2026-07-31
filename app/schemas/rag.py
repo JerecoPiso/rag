@@ -3,8 +3,8 @@ from typing import Any, Literal, List
 
 class RAGRequest(BaseModel):
     question:     str
-    provider:     Literal["openai", "anthropic", "google", "ollama"] = "openai"
-    tts_provider: Literal["openai", "piper"] = "openai"
+    provider:     Literal["openai", "anthropic", "google", "ollama"] = "ollama"
+    tts_provider: Literal["openai", "piper"] = "piper"
 
 class RAGResponse(BaseModel):
     question: str
@@ -51,7 +51,7 @@ class VectorRAGRequest(BaseModel):
     collection:      str = "rag_documents"
     provider:        Literal["openai", "anthropic", "google", "ollama"] = "ollama"
     history:         List[ChatMessage] = []
-    sql_provider:    Literal["openai", "anthropic", "google", "ollama"] | None = None
+    sql_provider:    Literal["openai", "anthropic", "google", "ollama"] | None = "ollama"
     tts_provider:    Literal["openai", "piper"] = "piper"
     conversation_id: str | None = None
 
