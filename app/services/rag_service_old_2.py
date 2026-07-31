@@ -119,70 +119,37 @@ class RAGService:
         "_patient_info":                        "created_timestamp",
     }
 
-    def _resolve_patient_and_table(
+    def _select_table(
         self,
         question: str,
         known_views: set[str],
         history: list[dict] | None = None,
-        session: dict | None = None,
-    ) -> tuple[str, str]:
-        """
-        Combined replacement for the old separate _select_table / _resolve_patient_name
-        calls. Neither decision depends on the other's output (both only look at the
-        question + history), so they're answered in a single LLM call instead of two.
-
-        Returns (patient_name, selected_table) — either may be "" if undetermined,
-        same semantics as before:
-        - patient_name falls back to session["patient_name"] if the LLM can't
-          determine one, and is stored back into session when it does.
-        - selected_table is "" if the answer isn't a recognized view name (caller
-          then falls back to letting SQL generation pick from the full schema).
-        """
+    ) -> str:
+        """Ask the LLM to pick the single best-matching view for the question,
+        from the fixed, described list of views. Returns "" if the answer isn't
+        a recognized view name (caller then falls back to letting SQL generation
+        pick from the full schema)."""
         catalog = "\n".join(
             f"- {view}: {desc}"
             for view, desc in self._VIEW_DESCRIPTIONS.items()
             if view in known_views
         )
+        if not catalog:
+            return ""
+
         history_block = self._format_history(history)
         prompt = (
             f"{history_block}"
             "Given this list of database views and what each one contains:\n\n"
             f"{catalog}\n\n"
-            "Answer two things about the question below:\n"
-            "1. table: Pick the ONE view from the list above that should be queried to answer it. "
-            "Respond with the exact view name, character-for-character as listed above — or an "
-            "empty string if none of them fit.\n"
-            "2. patient_name: Determine which patient the question refers to.\n"
-            "   - If the question itself explicitly names a patient, use that name exactly as written.\n"
-            "   - If the question uses a pronoun or implicit reference ('he', 'she', 'him', 'her', "
-            "'the patient', 'that patient') or names no patient at all, look at the conversation "
-            "history above and use the most recently mentioned patient's name.\n"
-            "   - If no patient name can be determined from the question or history, use exactly: NONE\n\n"
-            "Respond with ONLY a JSON object, no markdown, no explanation, in exactly this form:\n"
-            '{"table": "<view name or empty string>", "patient_name": "<name or NONE>"}\n\n'
+            "Pick the ONE view that should be queried to answer the following question. "
+            "Respond with ONLY the exact view name, character-for-character as listed above — "
+            "no explanation, no markdown, no punctuation.\n\n"
             f"Question: {question}"
         )
-        raw = self._call_llm(prompt).strip()
-        raw = re.sub(r"^```(?:json)?\n?", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\n?```$", "", raw).strip()
-
-        table = ""
-        name  = ""
-        try:
-            data  = json.loads(raw)
-            table = str(data.get("table") or "").strip()
-            name  = str(data.get("patient_name") or "").strip()
-        except json.JSONDecodeError:
-            pass
-
-        table = table if table in known_views else ""
-
-        if not name or name.upper() == "NONE":
-            name = (session or {}).get("patient_name", "")
-        elif session is not None:
-            session["patient_name"] = name
-
-        return name, table
+        answer = self._call_llm(prompt).strip()
+        answer = re.sub(r"^`|`$", "", answer).strip()
+        return answer if answer in known_views else ""
 
     # Table/view names the generated SQL actually references — used to catch
     # the LLM inventing a plausible-looking name (e.g. "_patient_case_diagnosis_vw")
@@ -252,6 +219,46 @@ class RAGService:
             "'that patient', or a patient named earlier if this question doesn't repeat it):\n"
             f"{convo}\n\n"
         )
+
+    def _resolve_patient_name(
+        self,
+        question: str,
+        history: list[dict] | None = None,
+        session: dict | None = None,
+    ) -> str:
+        """
+        Determine which patient this question is about, so that follow-up questions
+        that don't repeat the name (e.g. "what about his medicines?") still resolve
+        to the right patient instead of relying on the SQL-generation LLM to notice
+        the reference buried in raw history text.
+
+        - If the question itself explicitly names a patient, that name wins and is
+          stored in `session` (so it carries forward to later turns).
+        - Otherwise, if a patient is already active in `session`, reuse it.
+        - Otherwise, ask the LLM to look at the conversation history for the most
+          recently mentioned patient.
+        Returns "" if no patient can be determined.
+        """
+        prompt = (
+            f"{self._format_history(history)}"
+            "Determine which patient the following question refers to.\n"
+            "- If the question itself explicitly names a patient, return that name exactly as written.\n"
+            "- If the question uses a pronoun or implicit reference ('he', 'she', 'him', 'her', "
+            "'the patient', 'that patient') or names no patient at all, look at the conversation "
+            "history above and return the most recently mentioned patient's name.\n"
+            "- If no patient name can be determined from the question or history, respond with "
+            "exactly: NONE\n\n"
+            "Respond with ONLY the patient's name, or NONE — no explanation, no punctuation, no markdown.\n\n"
+            f"Question: {question}"
+        )
+        name = self._call_llm(prompt).strip().strip("`\"'")
+
+        if not name or name.upper() == "NONE":
+            return (session or {}).get("patient_name", "")
+
+        if session is not None:
+            session["patient_name"] = name
+        return name
 
     def _generate_sql(
         self,
@@ -417,9 +424,8 @@ class RAGService:
             return {"question": question, "sql": "", "result": [], "answer": answer}
 
         schema, known_views, columns_by_view = self._get_schema()
-        patient_name, selected_table = self._resolve_patient_and_table(
-            question, known_views, history, session
-        )
+        patient_name     = self._resolve_patient_name(question, history, session)
+        selected_table   = self._select_table(question, known_views, history)
         selected_columns = columns_by_view.get(selected_table)
         sql = self._generate_sql(
             question, schema, history, selected_table=selected_table,
