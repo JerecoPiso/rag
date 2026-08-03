@@ -322,13 +322,13 @@ class VectorService:
         "_patient_case_diet_vw":                frozenset({"diet", "food", "meal", "meals", "nutrition"}),
         "_patient_case_medicine_vw":            frozenset({"medicine", "medicines", "medication", "medications", "prescription", "prescriptions", "drug", "drugs"}),
         "_patient_case_medical_consumption_vw": frozenset({"consumption", "supply", "supplies", "ivf", "oxygen", "consumed"}),
-        "_patient_case_status_vw":              frozenset({"diagnosis", "diagnoses", "admission", "admitted", "discharge", "discharged", "classification", "complaint", "status"}),
+        "_patient_case_status_vw":              frozenset({"diagnosis", "station",  "discharge_date", "discharge date", "patient type",  "diagnoses", "admission", "admitted", "discharge", "discharged", "classification", "complaint", "status"}),
         "_patient_tpr_vw":                      frozenset({"tpr", "temperature", "pulse", "respiration", "vitals", "vital sign", "vital signs"}),
-        "_patient_opr_vw":                      frozenset({"opr", "outpatient"}),
+        "_patient_opr_vw":                      frozenset({"opr", "opr vital", "opr vitals", "outpatient vital signs", "outpatient vital sign", "outpatient vital signs"}),
         "_patient_monitor_vw":                  frozenset({"monitor", "monitoring", "monitoring vital", "monitoring vitals", "monitoring vital signs", "monitoring vital sign"}),
         "_patient_fluid_intake_and_output_vw":  frozenset({"fluid", "fiao", "intake", "output"}),
         "_patient_diagnostics_vw":              frozenset({"lab", "labs", "laboratory", "diagnostics", "diagnostic", "test", "tests", "result", "results"}),
-        "_patient_info":                        frozenset({"demographic", "demographics", "birthdate", "birthday", "address", "name", "contact", "phone", "email", "gender", "age", "patient info", "patient information"}),
+        "_patient_info":                        frozenset({"demographic", "demographics", "birthdate", "birthday", "address", "name", "contact", "phone", "email", "gender", "age", "patient info", "patient information", "father", "mother", "parent", "parents", "spouse", "husband", "wife", "guardian", "religion", "nationality", "civil", "married", "marital", "hospital number", "hospital no", "place of birth", "birthplace"}),
         "_patient_case_summary":                frozenset({"summary", "overview"}),
     }
 

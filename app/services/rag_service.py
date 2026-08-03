@@ -7,34 +7,52 @@ from fastapi import HTTPException
 from app.core.config import settings
 
 
+# Provider SDK clients hold no request-scoped state, but building a fresh one
+# isn't free — a new ollama.Client's first request carries a fixed ~2s penalty
+# (httpx's default system-proxy auto-detection on Windows) on top of actual
+# inference time. RAGService used to build one per request; now one client per
+# provider is built once and reused for the life of the process, the same fix
+# already applied to VectorService's Qdrant client in rag_controller.py.
+_clients: dict[str, object] = {}
+
+
+def _build_client(provider: str):
+    if provider == "openai":
+        from openai import OpenAI
+        return OpenAI(api_key=settings.OPENAI_API_KEY)
+    elif provider == "anthropic":
+        import anthropic
+        return anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    elif provider == "google":
+        from google import genai
+        return genai.Client(api_key=settings.GOOGLE_API_KEY)
+    elif provider == "ollama":
+        from ollama import Client as OllamaClient
+        return OllamaClient(host=settings.OLLAMA_URL)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
+
+
+def _get_client(provider: str):
+    client = _clients.get(provider)
+    if client is None:
+        client = _build_client(provider)
+        _clients[provider] = client
+    return client
+
+
 class RAGService:
     def __init__(self, db: Session, provider: str = "openai"):
         self.db       = db
         self.provider = provider.lower()
-        self._init_client()
+        self.client   = _get_client(self.provider)
 
-    def _init_client(self):
-        if self.provider == "openai":
-            from openai import OpenAI
-            self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        elif self.provider == "anthropic":
-            import anthropic
-            self.client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        elif self.provider == "google":
-            from google import genai
-            self.client = genai.Client(api_key=settings.GOOGLE_API_KEY)
-        elif self.provider == "ollama":
-            from ollama import Client as OllamaClient
-            self.client = OllamaClient(host=settings.OLLAMA_URL)
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown provider: {self.provider}")
-
-    def _call_llm(self, prompt: str) -> str:
+    def _call_llm(self, prompt: str, called_by: str) -> str:
         _t0 = time.perf_counter()
         try:
             return self._call_llm_inner(prompt)
         finally:
-            print(f"[TIMING] RAGService._call_llm({self.provider}) took {time.perf_counter() - _t0:.2f}s")
+            print(f"[TIMING] RAGService._call_llm({self.provider}) took {time.perf_counter() - _t0:.2f}s (called by {called_by})")
 
     def _call_llm_inner(self, prompt: str) -> str:
         if self.provider == "openai":
@@ -162,7 +180,7 @@ class RAGService:
             '{"table": "<view name or empty string>", "patient_name": "<name or NONE>"}\n\n'
             f"Question: {question}"
         )
-        raw = self._call_llm(prompt).strip()
+        raw = self._call_llm(prompt, called_by="resolve_patient_and_table").strip()
         raw = re.sub(r"^```(?:json)?\n?", "", raw, flags=re.IGNORECASE)
         raw = re.sub(r"\n?```$", "", raw).strip()
 
@@ -335,7 +353,7 @@ class RAGService:
             f"{correction_block}"
             f"Question: {question}"
         )
-        sql = self._call_llm(prompt)
+        sql = self._call_llm(prompt, called_by="generate_sql")
         sql = re.sub(r"^```(?:sql)?\n?", "", sql, flags=re.IGNORECASE)
         sql = re.sub(r"\n?```$", "", sql)
         return sql.strip()
@@ -350,6 +368,7 @@ class RAGService:
                 raise HTTPException(status_code=400, detail=f"Query contains forbidden keyword: {kw}")
 
     def _execute_sql(self, sql: str) -> list[dict]:
+        print(f"[DEBUG] Executing SQL:\n{sql}")
         result  = self.db.execute(text(sql))
         columns = list(result.keys())
         rows    = result.fetchall()
@@ -388,7 +407,7 @@ class RAGService:
             "- Do not volunteer additional information the question didn't ask for.\n"
             "- Return the smallest amount of information necessary to accurately answer the question."
         )
-        return self._call_llm(prompt)
+        return self._call_llm(prompt, called_by="generate_answer")
 
     _GREETING_WORDS = frozenset({
         "hello", "hi", "hey", "thanks", "thank", "good",
