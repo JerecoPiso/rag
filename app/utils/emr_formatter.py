@@ -596,10 +596,12 @@ _SOURCE_DATE_FIELD = {
 }
 
 # Views whose row identifier column isn't literally named "patient_id"
-# (e.g. _patient_info's primary key is "key") map to it here so
-# build_metadata can still populate a usable "patient_id" field.
+# map to it here so build_metadata can still populate a usable "patient_id"
+# field. _patient_info's "id" column is what matches patient_id elsewhere
+# (e.g. id=1348) — its "key" column is an unrelated hospital code
+# (e.g. "JARC3638"), not the patient id.
 _SOURCE_ID_FIELD = {
-    "_patient_info": "key",
+    "_patient_info": "id",
 }
 
 
