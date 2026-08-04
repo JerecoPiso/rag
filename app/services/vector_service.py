@@ -1048,6 +1048,40 @@ class VectorService:
         cleaned = " ".join(kept).strip()
         return cleaned or self._NO_MORTALITY_INFO
 
+    # The system prompt already tells the LLM to never remark that a question was
+    # already asked/repeated/rephrased or add asides about its own answering
+    # behavior — but small local (Ollama) models don't reliably follow that rule,
+    # especially once `history` already contains the same Q&A from an earlier
+    # turn. Deterministic backstop, same pattern as _guard_mortality_answer:
+    # strip any such meta-commentary regardless of exact phrasing.
+    # Broad, vocabulary-based rather than exact-phrase: the LLM keeps inventing
+    # new wordings for the same aside ("I repeated it for consistency", "Duplicate
+    # question answered in the same format", "the answer remains the same"...), so
+    # matching specific phrases is a losing chase. Instead strip any parenthetical
+    # that talks about the question/answer/format itself — legitimate clinical
+    # answers never use parentheses this way (see Answer Style examples above).
+    _META_COMMENTARY_PAREN = re.compile(
+        r'\s*\([^()]*\b(?:'
+        r'note|duplicate\w*|repeat(?:ed|s)?|rephrase\w*|unchanged|no\s+change|'
+        r'consisten\w*|previous(?:ly)?|remains?\s+the\s+same|same\s+(?:format|answer|response)|'
+        r'already\s+\w+|question|answer'
+        r')\b[^()]*\)',
+        re.IGNORECASE,
+    )
+    _META_COMMENTARY_SENTENCE = re.compile(
+        r'(?:^|(?<=[.!?]\s))(?:Note[:,]|Duplicate\s+question|The\s+answer\s+remains|'
+        r'This\s+is\s+a\s+duplicate|The\s+same\s+question|Since\s+the\s+answer|'
+        r'Since\s+this\s+(?:question|answer)|As\s+(?:previously|already)\s+'
+        r'(?:answered|stated|mentioned))[^.!?]*[.!?]',
+        re.IGNORECASE,
+    )
+
+    def _guard_meta_commentary(self, answer: str) -> str:
+        cleaned = self._META_COMMENTARY_PAREN.sub("", answer)
+        cleaned = self._META_COMMENTARY_SENTENCE.sub("", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        return cleaned or answer
+
     # Strips a leading correction phrase ("i mean", "sorry", "actually", ...)
     # so a follow-up like "i mean balansi jemar" can be checked against a name.
     _CORRECTION_PREFIX = re.compile(
@@ -1436,6 +1470,7 @@ class VectorService:
 
         messages = history[-self._MAX_HISTORY:] + [{"role": "user", "content": question}]
         answer   = self._call_llm(provider, system_prompt, messages)
+        answer   = self._guard_meta_commentary(answer)
         answer   = self._guard_mortality_answer(question, answer, context)
 
         return self._maybe_fallback({
