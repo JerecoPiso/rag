@@ -405,7 +405,10 @@ class RAGService:
             "doctor's orders, answer with only the doctor's orders, not other fields from the results "
             "(vitals, medicines, diet, status, etc.) even if they're present in the data above.\n"
             "- Do not volunteer additional information the question didn't ask for.\n"
-            "- Return the smallest amount of information necessary to accurately answer the question."
+            "- Return the smallest amount of information necessary to accurately answer the question.\n"
+            "- Never comment on whether this question was asked before, is a repeat, or was already "
+            "answered earlier in the conversation. Do not reference the conversation history at all — "
+            "just answer the current question directly, as if being asked for the first time."
         )
         return self._call_llm(prompt, called_by="generate_answer")
 
