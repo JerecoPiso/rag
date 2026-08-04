@@ -83,50 +83,10 @@ class VectorService:
 
     # ── Embedding ─────────────────────────────────────────────────────────────
 
-    # Conservative char cap for nomic-embed-text's ~2048-token context window.
-    # Long records are chunked below so this is only a backstop for a single
-    # chunk that's still too dense (e.g. unusually long unbroken lines).
-    _EMBED_MAX_CHARS = 6000
-
     # Converts a text string into an embedding vector using the configured Ollama model.
-    # Truncates (and, if still rejected, keeps halving) on "context length exceeded"
-    # errors rather than letting the whole ingest/search call fail.
     def _embed(self, text: str) -> list[float]:
-        truncated = text[:self._EMBED_MAX_CHARS]
-        while True:
-            try:
-                response = self.embed_client.embed(model=settings.OLLAMA_EMBED_MODEL, input=truncated)
-                return response.embeddings[0]
-            except Exception as e:
-                if "context length" not in str(e).lower() or len(truncated) <= 200:
-                    raise
-                truncated = truncated[:len(truncated) // 2]
-
-    # Max chars per embedding chunk, comfortably under _EMBED_MAX_CHARS, plus a
-    # small overlap carried into the next chunk so content split across a chunk
-    # boundary isn't invisible to either chunk's vector.
-    _CHUNK_MAX_CHARS = 3000
-    _CHUNK_OVERLAP   = 200
-
-    # Splits a formatted record into embeddable chunks along line boundaries
-    # (never mid-sentence/mid-line) so long free-text records (doctors'/nurses'
-    # notes, case summaries) stay fully searchable instead of being truncated.
-    # Short records (the common case) return a single-element list unchanged.
-    @classmethod
-    def _chunk_text(cls, text: str) -> list[str]:
-        if len(text) <= cls._CHUNK_MAX_CHARS:
-            return [text]
-        chunks: list[str] = []
-        current = ""
-        for line in text.splitlines(keepends=True):
-            if current and len(current) + len(line) > cls._CHUNK_MAX_CHARS:
-                chunks.append(current)
-                current = current[-cls._CHUNK_OVERLAP:] + line
-            else:
-                current += line
-        if current.strip():
-            chunks.append(current)
-        return chunks or [text]
+        response = self.embed_client.embed(model=settings.OLLAMA_EMBED_MODEL, input=text)
+        return response.embeddings[0]
 
     # ── Collection Setup ──────────────────────────────────────────────────────
 
@@ -189,13 +149,8 @@ class VectorService:
 
     # ── Ingest / Sync ─────────────────────────────────────────────────────────
 
-    # Splits each text into chunks and embeds them individually, upserting one Qdrant
-    # point per chunk — using a deterministic UUID (derived from source/case_id/text/
-    # chunk index) so re-ingesting the same record doesn't duplicate it. Every chunk's
-    # payload carries the FULL original text (not just its own chunk) so a hit on any
-    # chunk still gives the LLM the complete record; only the embedding is per-chunk.
-    # Returns the number of source records ingested (not the number of chunk points),
-    # matching the {"ingested": count} contract callers already rely on.
+    # Embeds a batch of texts and upserts them into Qdrant as points, using a deterministic
+    # UUID (derived from source/case_id/text) so re-ingesting the same record doesn't duplicate it.
     def ingest(
         self,
         texts: list[str],
@@ -207,21 +162,20 @@ class VectorService:
             return 0
         collection_name = collection_name or self.collection_name
         padded_meta = list(metadatas) + [{}] * (len(texts) - len(metadatas))
-        points = []
-        for text, meta in zip(texts, padded_meta):
-            chunks = self._chunk_text(text)
-            for chunk_index, chunk in enumerate(chunks):
-                points.append(PointStruct(
-                    id=str(uuid.uuid5(
-                        uuid.NAMESPACE_DNS,
-                        f"{meta.get('source', '')}:{meta.get('case_id', '')}:{text}:{chunk_index}",
-                    )),
-                    vector=self._embed(chunk),
-                    payload={"text": text, "chunk_index": chunk_index, "chunk_count": len(chunks), **meta},
-                ))
+        points = [
+            PointStruct(
+                id=str(uuid.uuid5(
+                    uuid.NAMESPACE_DNS,
+                    f"{meta.get('source', '')}:{meta.get('case_id', '')}:{text}",
+                )),
+                vector=self._embed(text),
+                payload={"text": text, **meta},
+            )
+            for text, meta in zip(texts, padded_meta)
+        ]
         for i in range(0, len(points), batch_size):
             self.client.upsert(collection_name=collection_name, points=points[i:i + batch_size])
-        return len(texts)
+        return len(points)
 
     # Detects ID-like column names (e.g. "id", "patient_id") so they can be excluded
     # from the human-readable text representation while still being kept in metadata.
@@ -516,14 +470,6 @@ class VectorService:
 
     # ── Rank Fusion ───────────────────────────────────────────────────────────
 
-    # Identifies which source record a chunk-point belongs to, so multiple chunk
-    # hits from the same long note collapse into one result instead of each
-    # eating a separate top_k slot. Mirrors the (source, case_id) pairing that
-    # ingest() already uses to number a record's chunks.
-    @staticmethod
-    def _record_key(payload: dict) -> tuple:
-        return (payload.get("source", ""), payload.get("case_id") or payload.get("id") or "")
-
     _RRF_K = 60  # standard smoothing constant from the original RRF paper
 
     @classmethod
@@ -677,22 +623,7 @@ class VectorService:
         # though each collection was only asked for top_k. Cap the final list
         # here so only the best-ranked hits are ever built into LLM context —
         # sending every fused hit was the dominant cost on multi-collection asks.
-        #
-        # A single long record can now surface as multiple chunk-points (see
-        # ingest()'s per-chunk embedding), which would otherwise let one record's
-        # chunks crowd out other distinct records' top_k slots. Keep only the
-        # best-scoring chunk per (source, case_id) before slicing to top_k.
-        all_ranked = sorted(rrf_scores, key=lambda doc_id: rrf_scores[doc_id], reverse=True)
-        ranked_ids: list = []
-        seen_records: set = set()
-        for doc_id in all_ranked:
-            key = self._record_key(payload_by_id[doc_id])
-            if key in seen_records:
-                continue
-            seen_records.add(key)
-            ranked_ids.append(doc_id)
-            if len(ranked_ids) >= top_k:
-                break
+        ranked_ids = sorted(rrf_scores, key=lambda doc_id: rrf_scores[doc_id], reverse=True)[:top_k]
         results = [
             {
                 "score": rrf_scores[doc_id],
