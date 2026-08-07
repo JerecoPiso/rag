@@ -51,7 +51,7 @@ class VectorRAGRequest(BaseModel):
     collection:      str = "rag_documents"
     provider:        Literal["openai", "anthropic", "google", "ollama"] = "ollama"
     history:         List[ChatMessage] = []
-    sql_provider:    Literal["openai", "anthropic", "google", "ollama"] | None = "ollama"
+    sql_provider:    Literal["openai", "anthropic", "google", "ollama"] | None = "openai"
     tts_provider:    Literal["openai", "piper"] = "piper"
     conversation_id: str | None = None
 
@@ -64,7 +64,7 @@ class VectorRAGResponse(BaseModel):
     audio:           str | None = None  # data URI (e.g. "data:audio/mpeg;base64,...") of the spoken answer
 
 class SyncRequest(BaseModel):
-    collection: str = "rag_documents"
+    collection: str = "_patient_info"
     clear:      bool = True
 
 class SyncResponse(BaseModel):
@@ -73,7 +73,7 @@ class SyncResponse(BaseModel):
 
 class SyncLatestRequest(BaseModel):
     since:      str | None = None  # optional override; defaults to setting_tbl's stored last-sync time
-    collection: str = "rag_documents"
+    collection: str = "_patient_info"
 
 class SyncLatestResponse(BaseModel):
     total_ingested: int

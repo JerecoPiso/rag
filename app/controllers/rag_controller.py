@@ -57,8 +57,9 @@ class RAGController:
     
     @staticmethod
     def ask(data: RAGRequest, db: Session = Depends(get_db)):
-        result = RAGService(db, provider=data.provider).ask(data.question)
+        print(f"Provider: {data.provider}, Question: {data.question}")
 
+        result = RAGService(db, provider=data.provider).ask(data.question)
         audio = None
         if result.get("answer"):
             try:
